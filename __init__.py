@@ -248,17 +248,21 @@ class EventEmitter(pydle.Client):
             self.emit('raw_' + cmd.lower())
         return super().on_raw(message)
 
-    def on(self, event, fn=None):
+    def on(self, event, fn=None, prepend=False):
         """
         Calls fn upon the specified event.  If fn is None, returns a decorator
 
         :param event: Event name.
         :param fn: Function to call.  If None, returns a decorator
+        :param prepend: If True, adds to the beginning of the list rather than the end.
         :returns: Decorator or `fn`
         """
         if fn is None:
-            return functools.partial(self.on, event)
-        self.events[event].append(fn)
+            return functools.partial(self.on, event, prepend=prepend)
+        if prepend:
+            self.events[event].insert(0, fn)
+        else:
+            self.events[event].append(fn)
 
 
 def _add_emitter(attr):
@@ -269,7 +273,6 @@ def _add_emitter(attr):
 
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
-        print(event)
         rv = fn(self, *args, **kwargs)
         self.emit(event, *args, **kwargs)
         return rv
@@ -311,11 +314,14 @@ class Bot(EventEmitter):
         self.global_throttle = Throttle(main.burst, main.rate)
         self.target_throttles = {}
         self.throttle_lock = threading.RLock()
+        self.rules = []
 
         self.textwrapper = textwrap.TextWrapper(
             width=main.wrap_length, subsequent_indent=main.wrap_indent,
             replace_whitespace=False, tabsize=4, drop_whitespace=True
         )
+
+        self.data = {}
 
     @contextlib.contextmanager
     def log_exceptions(self, target=None):
@@ -366,7 +372,21 @@ class Bot(EventEmitter):
             except pydle.AlreadyInChannel:
                 pass
 
-    def command(self, fn=None, name=None, aliases=None, patterns=None, bindings=None, doc=None):
+    def rule(self, pattern, fn=None):
+        """
+        Calls the decorated function if a message matches 'pattern'
+        :param pattern: String or regex
+        :param fn: Function to call.  Returns decorator if None.
+        :return: fn or decorator
+        """
+        if fn is None:
+            return functools.partial(self.rule, pattern)
+        if isinstance(pattern, str):
+            pattern = re.compile(pattern)
+        self.rules.append((pattern, fn))
+        return fn
+
+    def command(self, name=None, aliases=None, patterns=None, bindings=None, doc=None):
         """
         Same as :decorator:`ircbot.commands.command`, but using our command registry.
 
@@ -378,7 +398,7 @@ class Bot(EventEmitter):
         :param doc: Initial documentation
         :return: fn
         """
-        return ircbot.commands.command(fn, name, aliases, patterns, bindings, doc, self.command_registry)
+        return ircbot.commands.command(name, aliases, patterns, bindings, doc, self.command_registry)
 
     def throttled(self, target, fn, cost=1):
         """
@@ -434,7 +454,7 @@ class Bot(EventEmitter):
 
     def _msgwrapper(self, parent, target, message, wrap=True, throttle=True, cost=1):
         if wrap:
-            message = self.wraptext(message)
+            message = "\n".join(self.wraptext(message))
         for line in message.replace('\r', '').split('\n'):
             if throttle:
                 self.throttled(target, functools.partial(parent, target, line), cost)
@@ -484,23 +504,45 @@ class Bot(EventEmitter):
             if not isinstance(reply_to, str):
                 reply_to = ", ".join(reply_to)
             message = reply_to + ": " + message
-        return self.message(message, target, *args, **kwargs)
+        return self.message(target, message, *args, **kwargs)
 
     @pydle.coroutine
-    def on_message(self, target, nick, message):
+    def handle_message(self, irc_command, target, nick, message):
+        """
+        Handles incoming messages
+        :param irc_command: PRIVMSG or NOTICE
+        :param target: Message target
+        :param nick: Nickname of sender
+        :param message: Messge
+        :return:
+        """
         super().on_message(target, nick, message)
-        parsed = self.command_registry.parse(message)
-        if not parsed:
-            return
-        if parsed:
-            event = Event.from_parseresult(self, 'PRIVMSG', nick, target if self.is_channel(target) else None, parsed)
+        channel = target if self.is_channel(target) else None
+        factory = functools.partial(
+            Event, bot=self, irc_command=irc_command, nick=nick, channel=channel, message=message
+        )
+
+        for pattern, fn in self.rules:
+            match = pattern.match(message)
+            if match:
+                event = factory(command=fn, text=message, match=match)
+                with self.log_exceptions(target):
+                    result = event()
+                    if isinstance(result, pydle.Future):
+                        yield result
+
+        event = self.command_registry.parse(message, factory=factory)
+        if event.command:
             with self.log_exceptions(target):
                 try:
-                    result = parsed(event)
+                    result = event()
                     if isinstance(result, pydle.Future):
                         yield result
                 except ircbot.commands.UsageError as ex:
                     self.notice(nick, str(ex))
+
+    def on_message(self, target, nick, message):
+        return self.handle_message('PRIVMSG', target, nick, message)
 
 
 def _implied_target(method):
@@ -512,38 +554,50 @@ def _implied_target(method):
     """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
-        target = kwargs.pop('target', None) or self.channel or self.nick
+        target = kwargs.pop('target', None) or self.target
         return method(self, target, *args, **kwargs)
     return wrapper
 
 
 # noinspection PyIncorrectDocstring
-class Event:
+class Event(ircbot.commands.Invocation):
     """
-    Passed to command functions when magic happens.
+    Passed to command and rule functions when magic happens.
     """
-    nick = None     # Triggering nick
-    channel = None  # Triggering channel.  None on a PM
-    bot = None      # Underlying bot instance.
-    command = None  # Triggering command.
-    prefix = None  # Triggering command prefix
-    arglist = None  # Triggering arglist.
-    name = None  # Triggering IRC command (e.g. PRIVMSG, NOTICE)
 
-    WRAPPED_METHODS = ['say', 'message', 'notice']
+    def __init__(
+            self,
+            prefix=None, name=None, command=None, text=None,
+            bot=None, irc_command=None, nick=None, channel=None, match=None, message=None
+    ):
+        """
+        Creates a new :class:`Event`
 
-    def __init__(self, bot, name, nick, channel, prefix, command, arglist):
+        :param prefix: Prefix that matched.  Will be None if there was no match.
+        :param name: Name of command as entered (minus prefix).  May differ from command.name
+        :param command: :class:`Command` object that matched.  Will be None if there was no command match.
+        :param text: Argument text that matched.
+        :param bot: IRC Bot instance
+        :param irc_command: IRC command name (e.g. PRIVMSG)
+        :param nick: Triggering nickname
+        :param channel: Triggering channel, or None for PMs.
+        :param match: Triggering pattern (for rule matches)
+        :param message: Full IRC message
+        """
+        super().__init__(prefix=prefix, name=name, command=command, text=text)
         self.bot = bot
-        self.name = name
+        self.irc_command = irc_command
         self.nick = nick
         self.channel = channel
-        self.prefix = prefix
-        self.command = command
-        self.arglist = arglist
+        self.match = match
+        self.message = message
 
     @classmethod
     def from_parseresult(cls, bot, name, nick, channel, result):
-        return cls(bot, name, nick, channel, result.prefix, result.command, result.arglist)
+        return cls(
+            bot, name, nick, channel,
+            prefix=result.prefix, command=result.command, arglist=result.arglist, message=result.arglist.text
+        )
 
     @_implied_target
     def reply(self, target, message, reply_to=None, *args, **kwargs):
@@ -554,6 +608,8 @@ class Event:
     def message(self, *args, **kwargs):
         """bot.message with a default target"""
         return self.bot.message(*args, **kwargs)
+
+    say = message
 
     @_implied_target
     def notice(self, *args, **kwargs):
@@ -591,6 +647,13 @@ class Event:
     def kickban(self, channel=None, target=None, reason=None, range=0):
         """bot.kickban with an implied channel (if we have one) and target"""
         return self.bot.kickban(channel or self.channel, target or self.target, reason, range)
+
+    @property
+    def target(self):
+        """
+        Returns the channel that invoked this (if any), otherwise the sender
+        """
+        return self.channel or self.nick
 
     def __getattr__(self, item):
         """Relay unknown attribute calls to the bot"""
@@ -737,4 +800,4 @@ class Throttle:
             return None
         if not self.rate:
             return self.ZEROTIME
-        return max(self.ZEROTIME, self.next + (self.rate * (self.next_cost() - 1)))
+        return max(self.ZEROTIME, self.next - datetime.datetime.now() + (self.rate * ((self.next_cost() or 0) - 1)))

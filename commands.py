@@ -56,24 +56,33 @@ __all__ = [
 ]
 
 
+_default = object()
+
+
 class Argument(str):
     """
     Like a str, but with some added attributes useful in command parsing.
 
     Normally, Arguments should not be constructed directly but instead created in bulk from an ArgumentList.
     """
-    def __init__(self, s, text, span):
+
+    # str subclassing is a pain
+    def __new__(cls, s, text, span):
+        rv = str.__new__(cls, s)
+        return rv
+
+    def __init__(self, s, text, start):
         """
         Constructs a new Argument
 
         :param s: String that we will be set to.
         :param text: Full line of text involved in the original parse.
-        :param span: Tuple of (start, end) representing where we were located in the original parse.
+        :param start: Tuple of (start, end) representing where we were located in the original parse.
         """
+        super().__init__()
         self._text = text
-        self._start = span[0]
+        self._start = start
         self._eol = None
-        super().__init__(s)
 
     @property
     def eol(self):
@@ -190,7 +199,7 @@ class UsageError(Exception):
     """
     Thrown when a command is called with invalid syntax.
     """
-    def __init__(self, message=None, args=None, param=None):
+    def __init__(self, message=None, arglist=None, param=None):
         """
         Creates a new UsageError.
 
@@ -207,9 +216,12 @@ class UsageError(Exception):
         were still wrong.
 
         :param message: Error message.
-        :param args: The ArgumentList that was being parsed.
+        :param arglist: The ArgumentList that was being parsed.
         :param param: The Parameter that triggered the error.
         """
+        self.message = message
+        self.arglist = arglist
+        self.param = param
 
 
 class FinalUsageError(UsageError):
@@ -354,7 +366,7 @@ class Binding:
                     | # Or a constant w/o parenthesis
                     (?:
                         (?:(?P<const_arg_1>%N+?)=)?     # optional argument name
-                        (?P<const_value_1>%N+?)         # constant phrase
+                        (?P<const_options_1>%N+?)       # constant phrase
                         (?:\?(?P<const_name_1>%N+?))?   # helptext
                     )
                     | # Or anything else, which is invalid
@@ -439,13 +451,13 @@ class Binding:
                 )
             # Parse our funky regex settings
             data = collections.defaultdict(dict)
-            for key, value in match.groupdict.items():
+            for key, value in match.groupdict().items():
                 if value is None:
                     continue
                 keytype, key, *unused = key.split("_")
                 data[keytype][key] = value
-            prefix = "".join(v for k, v in sorted(data.pop('prefix', {}).items(), key=lambda x: match.group(x[0])))
-            suffix = "".join(v for k, v in sorted(data.pop('suffix', {}).items(), key=lambda x: match.group(x[0])))
+            prefix = "".join(v for k, v in sorted(data.pop('prefix', {}).items(), key=lambda x: int(x[0])))
+            suffix = "".join(v for k, v in sorted(data.pop('suffix', {}).items(), key=lambda x: int(x[0])))
             assert len(data) == 1, "Unexpectedly matched multiple sections of paramstring."
 
             paramtype, data = data.popitem()  # Should only have one key left.
@@ -501,7 +513,7 @@ class Binding:
         self.usage = " ".join(usage)
 
     @classmethod
-    def register_type(cls, class_, typename=None, *args, **kwargs):
+    def register_type(cls, class_, typename=_default, *args, **kwargs):
         """
         Registers a subclass of :class:`ParamType` as a type handler to match cases of <param:typename>
 
@@ -512,7 +524,8 @@ class Binding:
         :param kwargs: Passed to _class's constructor after 'options'.
         """
         if class_ is not None and not callable(class_):
-            args = [typename] + list(args)
+            if typename is not _default:
+                args = [typename] + list(args)
             typename = class_
             class_ = None
 
@@ -524,10 +537,10 @@ class Binding:
 
         return decorator if class_ is None else decorator(class_)
 
-    def bind(self, arglist, *args, **kwargs):
+    def bind(self, invocation, *args, **kwargs):
         """
         Binds the information in input_string
-        :param arglist: An :class:`ArgumentList` cosisting of the arguments we wish to bind.
+        :param invocation: An :class:`Invocation`
         :param args: Initial arguments to include in binding.
         :param kwargs: Initial keyword arguments to include in binding.
         :return: Outcome of signature.Bind()
@@ -540,10 +553,10 @@ class Binding:
             else:
                 kwargs[self.binding_arg] = self
         for param in self.params:
-            param.bind(arglist, args, kwargs)
-        return self.signature.bind(*args, **kwargs)
+            param.bind(invocation.arglist, args, kwargs)
+        return self.signature.bind(invocation, *args, **kwargs)
 
-    def __call__(self, arglist, *args, **kwargs):
+    def __call__(self, invocation, *args, **kwargs):
         """
         Calls the bound function.
 
@@ -554,7 +567,7 @@ class Binding:
         :param kwargs: Initial keyword arguments to include in binding.
         :return: Result of function call.
         """
-        bound = self.bind(arglist, *args, **kwargs)
+        bound = self.bind(invocation, *args, **kwargs)
         return self.function(*bound.args, **bound.kwargs)
 
 
@@ -585,13 +598,14 @@ class Parameter:
         self.parent = parent
         self.arg = arg
         self.type_ = type_
-        self.options = None
+        self.options = options
         self.name = name
         self.listmode = listmode
         self.required = required
 
         parser_class, args, kwargs = self.parent.type_registry[self.type_]
         self.parser = parser_class(self, *args, **kwargs)
+        self.eol = self.parser.eol
 
     def args(self, arglist):
         """
@@ -601,7 +615,7 @@ class Parameter:
         """
         index = self.index
         while index < len(arglist):
-            yield index
+            yield arglist[index]
             if not self.listmode:
                 return
 
@@ -647,7 +661,7 @@ class Parameter:
                 raise UsageError(ex.message, arglist, index)
             except Exception as ex:
                 if self.parser.wrap_exceptions:
-                    raise UsageError("Invalid format for {name}") from ex
+                    raise UsageError("Invalid format for {}".format(self.name)) from ex
                 raise
         if not self.arg:
             # If we don't have an argument name, we don't want to update anything.  However, it's still necessary to
@@ -703,7 +717,7 @@ class ParamType:
         :param value: Value to parse.
         :return: Parsed result.
         """
-        return self.value
+        return value
 
     def validate(self, value):
         """
@@ -821,6 +835,65 @@ class NumberParamType(ParamType):
 
 
 # noinspection PyShadowingNames
+class Invocation:
+    """Stores the result from :meth:`CommandRegistry.parse`, and includes data passed to commands and bindings."""
+    def __init__(self, prefix=None, name=None, command=None, text=None):
+        """
+        Creates a new :class:`Invocation`
+
+        :param prefix: Prefix that matched.  Will be None if there was no match.
+        :param name: Name of command as entered (minus prefix).  May differ from command.name
+        :param command: :class:`Command` object that matched.  Will be None if there was no command match.
+        :param text: Argument text that matched.
+        """
+        self.prefix = prefix
+        self.irc_command = name
+        self.command = command
+        self.text = text
+        self._arglist = None
+        self.binding = None
+
+    @property
+    def full_name(self):
+        """
+        Returns the full command name used.  (Essentially prefix + command)
+        """
+        return self.prefix + self.command
+
+
+    def __bool__(self):
+        """
+        Returns True if `self.command` is not None
+        """
+        return self.command is not None
+
+    @property
+    def arglist(self):
+        """
+        Returns the :class:`ArgumentList` in this result.  Computed on first use.
+
+        :raises: :class:`ValueError` if self.text is None and thus no :class:`ArgumentList` can be constructed.
+        """
+        if self._arglist is None:
+            if self.text is None:
+                raise ValueError("Cannot parse arglist: no text available.")
+            self._arglist = ArgumentList(self.text)
+        return self._arglist
+
+    def __call__(self, *args, **kwargs):
+        """
+        Calls self.command.
+
+        :param args: Initial arguments (prior to binding)
+        :param kwargs: Initial kwargs (prior to binding)
+        :return: self.command's return value.
+        """
+        if not self:
+            raise ValueError("No command bound.")
+        return self.command(self, *args, **kwargs)
+
+
+# noinspection PyShadowingNames
 class Registry:
     """
     Registers commands and serves as the intermediary between command and interface.
@@ -862,7 +935,7 @@ class Registry:
 
         :param search: Command to search for.
         """
-        search = search.lower.strip()
+        search = search.lower().strip()
         command = self.aliases.get(search)
         if command:
             yield command
@@ -878,75 +951,25 @@ class Registry:
         """
         return next(self.lookup_all(search), None)
 
-    def parse(self, text):
+    def parse(self, text, factory=Invocation):
         """
-        Parses a line of text and returns a :class:`ParseResult` representing the outcome of the parse.
+        Parses a line of text and returns a :class:`Invocation` representing the outcome of the parse.
 
-        If no command is found, the returned ParseResult will be false-y.  You can test to see if anything matched at
-        all by seeing if ParseResult.prefix is None or parseResult.text is None.
+        If no command is found, `Invocation.command` will be None.
 
-        :param text: Text to examine.
-        :returns: :class:`ParseResult`
+        :param text: Text to parse
+        :param factory: Factory class to use instead of Invocation.  Must accept prefix, name, command and text kwargs.
+        :returns: :class:`Invocation` or factory class.
         """
         match = self.prefix.match(text)
         if not match:
-            return ParseResult.NULL_RESULT
+            return factory()
         prefix = match.group(0)
 
-        # chain is to ensure there's always at least two elements by adding a dummy one.
+        # chain is to ensure there's always at least two elements by adding some dummy ones.
         search, text, *_ = itertools.chain(self.separator.split(text[match.end(0):], 1), ['']*2)
-        return ParseResult(prefix, self.lookup(search), text)
+        return factory(prefix=prefix, name=search, command=self.lookup(search), text=text)
 DEFAULT_REGISTRY = Registry(prefix='!')
-
-
-# noinspection PyShadowingNames
-class ParseResult:
-    """Stores the result from :meth:`CommandRegistry.parse`"""
-    def __init__(self, prefix=None, command=None, text=None):
-        """
-        Creates a new :class:`PreparseResult`
-
-        :param prefix: Prefix that matched.  Will be None if there was no match.
-        :param command: Command that matched.  Will be None if there was no command match.
-        :param text: Remaining text that matched.
-        """
-        self.prefix = prefix
-        self.command = command
-        self.text = text
-        self._arglist = None
-
-    def __bool__(self):
-        """
-        Returns True if `self.command` is not None
-        """
-        return self.command is not None
-
-    @property
-    def arglist(self):
-        """
-        Returns the :class:`ArgumentList` in this result.  Computed on first use.
-
-        :raises: :class:`ValueError` if self.text is None and thus no :class:`ArgumentList` can be constructed.
-        """
-        if self._arglist is None:
-            if self.text is None:
-                raise ValueError("Cannot parse arglist: no text available.")
-            self._arglist = ArgumentList(self.text)
-        return self._arglist
-
-    def __call__(self, *args, **kwargs):
-        """
-        Calls self.command.
-
-        :param args: Initial arguments (prior to binding)
-        :param kwargs: Initial kwargs (prior to binding)
-        :return: self.command's return value.
-        """
-        if not self:
-            raise ValueError("No command bound.")
-        return self.command(*args, **kwargs)
-
-ParseResult.NULL_RESULT = ParseResult()
 
 
 # noinspection PyShadowingNames
@@ -1016,26 +1039,31 @@ class Command:
             else:
                 self.name = altname
 
-    def __call__(self, arglist, *args, **kwargs):
+    def __call__(self, invocation, *args, **kwargs):
         """
         Calls bound functions until one returns or raises FinalUsageError.
+
+        :param invocation: A :class:`Invocation` instance representing information we were called with.
 
         All arguments are passed to `CommandBinding.__call__`
         """
         if not self.bindings:
             raise ValueError("Command has no bindings")
 
-        error = None
+        error_binding, error = None, None
         for binding in self.bindings:
             try:
-                return binding(arglist, *args, **kwargs)
+                return binding(invocation, *args, **kwargs)
             except FinalUsageError:
                 raise
             except UsageError as ex:
                 if error is None or binding.default_error:
                     error = ex
+                    error_binding = binding
         if self.usage:
             raise UsageError(self.usage)
+        elif not error.message:
+            raise UsageError("Usage: {command} {usage}".format(command=invocation.full_name, usage=error_binding.usage))
         raise error
 
 
@@ -1094,13 +1122,14 @@ def chain_decorator(fn):
 
     :param fn: Function to decorate.
     """
-    @wrap_decorator
     @functools.wraps(fn)
+    @wrap_decorator
     def wrapper(pending, *args, **kwargs):
         if not isinstance(pending, PendingCommand):
             pending = PendingCommand(pending)
-        fn(*args, **kwargs)
+        fn(pending, *args, **kwargs)
         return pending
+    return wrapper
 
 
 # noinspection PyShadowingNames
