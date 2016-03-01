@@ -14,7 +14,8 @@ import sys
 import textwrap
 import threading
 import traceback
-
+import itertools
+import operator
 import pydle
 
 import ircbot.commands
@@ -386,19 +387,16 @@ class Bot(EventEmitter):
         self.rules.append((pattern, fn))
         return fn
 
-    def command(self, name=None, aliases=None, patterns=None, bindings=None, doc=None):
+    def command(self, *args, **kwargs):
         """
-        Same as :decorator:`ircbot.commands.command`, but using our command registry.
+        Same as :decorator:`ircbot.commands.command`, but using our command registry by default.
 
-        :param fn: Function to wrap
-        :param name: Command name
-        :param aliases: Initial aliases
-        :param patterns: Initial patterns
-        :param bindings: Initial bindings
-        :param doc: Initial documentation
+        :param args: Passed to decorator
+        :param kwargs: Passed to decorator
         :return: fn
         """
-        return ircbot.commands.command(name, aliases, patterns, bindings, doc, self.command_registry)
+        kwargs.setdefault('registry', self.command_registry)
+        return ircbot.commands.command(*args, **kwargs)
 
     def throttled(self, target, fn, cost=1):
         """
@@ -658,6 +656,68 @@ class Event(ircbot.commands.Invocation):
     def __getattr__(self, item):
         """Relay unknown attribute calls to the bot"""
         return getattr(self.bot, item)
+
+
+def help_command(event, name=None):
+    """
+    Produces help.
+    :param event: Event
+    :param name: Optional command name to search for.
+    """
+    registry = event.bot.command_registry
+    reply = functools.partial(event.notice, target=event.nick)
+
+    if name:
+        search = registry.parse(name)
+        if search.command:
+            command = search.command
+            name = search.full_name
+        else:
+            command = registry.lookup(name)
+            name = event.prefix + name
+        if not command:
+            reply(
+                "Unknown command {name}.  See {help_command} for a complete list of commands"
+                .format(name=name, help_command=event.full_name)
+            )
+            return
+        for ix, binding in enumerate(command.bindings):
+            fmt = "{usage} {name} {binding.usage}"
+            if binding.summary:
+                fmt += " -- {binding.summary}"
+            reply(fmt.format(usage="      " if ix else "Usage:", name=name, binding=binding))
+            if command.doc:
+                reply(command.doc)
+
+        return
+
+    # Build a wordwrapper for formatting the command list.
+    ww = textwrap.TextWrapper(
+        width=80, subsequent_indent="... "
+    ).wrap
+
+    # Build unique list of commands
+    commands = set(itertools.chain(registry.aliases.values(), registry.patterns.values()))
+
+    reply("For detailed help on a specific command, use {} <command>".format(event.full_name))
+    # Sort it and group by category
+    for category, commandlist in itertools.groupby(
+        sorted(commands, key=lambda item: ((item.category or "").lower(), item.name)),
+        key=lambda item: (item.category or "").lower()
+    ):
+        fmt = ("[{category}]: " if category else "") + "{commands}"
+        for line in ww(fmt.format(
+            category=category.upper(),
+            commands=", ".join(command.name for command in commandlist))
+        ):
+            reply(line)
+
+
+def add_help_command(bot, name='help'):
+    pending = commands.bind(
+        help_command, '[<name?command>]', 'Shows a list of commands or detailed help on one command.'
+    )
+    bot.command(pending, name)
 
 
 class Throttle:

@@ -92,7 +92,7 @@ class Argument(str):
         Calculated on first access.
         """
         if self._eol is None:
-            self._eol = self.text[self._start:]
+            self._eol = self._text[self._start:]
             del self._text
             del self._start
         return self._eol
@@ -384,7 +384,7 @@ class Binding:
     FIRST_ARG = object()
     LAST_ARG = object()
 
-    def __init__(self, function, paramstring, label=None, summary=None, command=None):
+    def __init__(self, function, paramstring, summary=None, label=None, command=None):
         """
         Creates a new :class:`CommandBinding`.
 
@@ -836,7 +836,7 @@ class NumberParamType(ParamType):
 
 # noinspection PyShadowingNames
 class Invocation:
-    """Stores the result from :meth:`CommandRegistry.parse`, and includes data passed to commands and bindings."""
+    """Stores the result from :meth:`Registry.parse`, and includes data passed to commands and bindings."""
     def __init__(self, prefix=None, name=None, command=None, text=None):
         """
         Creates a new :class:`Invocation`
@@ -847,7 +847,7 @@ class Invocation:
         :param text: Argument text that matched.
         """
         self.prefix = prefix
-        self.irc_command = name
+        self.name = name
         self.command = command
         self.text = text
         self._arglist = None
@@ -858,7 +858,7 @@ class Invocation:
         """
         Returns the full command name used.  (Essentially prefix + command)
         """
-        return self.prefix + self.command
+        return self.prefix + self.name
 
 
     def __bool__(self):
@@ -969,6 +969,7 @@ class Registry:
         # chain is to ensure there's always at least two elements by adding some dummy ones.
         search, text, *_ = itertools.chain(self.separator.split(text[match.end(0):], 1), ['']*2)
         return factory(prefix=prefix, name=search, command=self.lookup(search), text=text)
+
 DEFAULT_REGISTRY = Registry(prefix='!')
 
 
@@ -995,7 +996,7 @@ class Command:
     patterns = []    # Patterns.  (Regular expressions or strings that will be compiled into one)
     bindings = []    # Associated command bindings, in order of priority.
 
-    def __init__(self, name=None, aliases=None, patterns=None, bindings=None, doc=None, usage=None):
+    def __init__(self, name=None, aliases=None, patterns=None, bindings=None, doc=None, usage=None, category=None):
         """
         Defines a new command.
 
@@ -1014,6 +1015,7 @@ class Command:
         self._done = False
         self.pending_functions = []  # From things being added by decorators.
         self.usage = usage
+        self.category = category
 
     def finish(self, altname=None):
         """
@@ -1076,16 +1078,17 @@ class PendingCommand:
     def __init__(self, function):
         self.function = function
         self.command = Command()
-
         # These all resemble the Command counterparts, but will be reversed upon being finalized.
         self.bindings = []
         self.patterns = []
         self.aliases = []
         self.help = []
-        self.__call__ = function
+
+    def __call__(self, *args, **kwargs):
+        return self.function(*args, **kwargs)
 
 
-def wrap_decorator(fn):
+def wrap_decorator(fn, index=None):
     """
     Returns a version of the function wrapped in such a way as to allow both decorator and non-decorator syntax.
 
@@ -1094,13 +1097,16 @@ def wrap_decorator(fn):
     Otherwise, returns a decorator
 
     :param fn: Function to decorate.
+    :param index: Argument index of the function.  Defaults to 0.
     """
     # Determine the name of the first argument, in case it is specified in kwargs instead.
     signature = inspect.signature(fn)
     arg = None
     param = next(iter(signature.parameters.values()), None)
-    if param and param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+    assert param
+    if param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
         arg = param.name
+    assert arg
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -1134,7 +1140,10 @@ def chain_decorator(fn):
 
 # noinspection PyShadowingNames
 @wrap_decorator
-def command(fn=None, name=None, aliases=None, patterns=None, bindings=None, doc=None, registry=DEFAULT_REGISTRY):
+def command(
+    fn=None, name=None, aliases=None, patterns=None, bindings=None, doc=None, category=None, usage=None,
+    registry=DEFAULT_REGISTRY
+):
     """
     Command decorator.
 
@@ -1147,6 +1156,7 @@ def command(fn=None, name=None, aliases=None, patterns=None, bindings=None, doc=
     :param patterns: Regex patterns.
     :param bindings: Bindings.
     :param doc: Helptext.
+    :param category: Category.
     :param registry: Which :class:`CommandRegistry` the command will be registered in.  None disables registration.
     :return: fn.function or fn
     """
@@ -1154,6 +1164,8 @@ def command(fn=None, name=None, aliases=None, patterns=None, bindings=None, doc=
         fn = PendingCommand(fn)
     c = fn.command
     c.name = name
+    c.category = category
+    c.usage = usage
     c.aliases = (aliases or []) + list(reversed(fn.aliases))
     c.patterns = (patterns or []) + list(reversed(fn.patterns))
     c.bindings = (bindings or []) + list(reversed(fn.bindings))
@@ -1165,7 +1177,7 @@ def command(fn=None, name=None, aliases=None, patterns=None, bindings=None, doc=
 
 
 @chain_decorator
-def bind(fn, paramstring, label=None, summary=None):
+def bind(fn, paramstring, summary=None, label=None):
     """
     Adds a :class:`CommandBinding` to the pending command.  See that class for details on arguments.
     :param fn: Function to decorate, or a :class:`PendingCommand` instance.
@@ -1174,7 +1186,7 @@ def bind(fn, paramstring, label=None, summary=None):
     :param summary: Optional usage summary for help.
     :return:
     """
-    fn.bindings.append(Binding(fn.function, paramstring, label, summary))
+    fn.bindings.append(Binding(fn.function, paramstring, summary, label))
 
 
 @chain_decorator
