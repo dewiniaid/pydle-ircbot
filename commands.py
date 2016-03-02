@@ -305,10 +305,12 @@ class Binding:
     - An optional helpname, consisting of a question mark (?) followed by text that should be used in place of the
       variable name in help.  This may contain spaces.
 
-    The variable name may be followed by a '*' or a '+' to indicate that it should receive the remaining arguments as a
+    The variable name may be preceded by a '*' or a '+' to indicate that it should receive the remaining arguments as a
     list.  If this is the case, it must be the final parameter.  If the variable name is the same as the name of the
     *args parameter in the function, '*' is implied if neither option is specified.  '*' means it must have 0 or more
-    arguments, '+' is 1 or more.
+    arguments, '+' is 1 or more..
+
+    Alternatively, the variable name may be preceded by a '?' to indicate that it is optional.
 
     Options:
     ----------
@@ -352,6 +354,7 @@ class Binding:
                 (?:
                     # Parameter
                     (?:(?P<prefix_1>\<)                 # begin
+                        (?P<var_count>[+*?])?           # argument count.
                         (?P<var_arg>%N+?)               # argument name
                         (?:\:(?P<var_type>%N+?))?       # optional type specifier
                         (?:\:(?P<var_options>%N+?))?    # optional type specifier
@@ -359,12 +362,14 @@ class Binding:
                     (?P<suffix_1>\>))                   # end
                     | # Or constant
                     (?:(?P<prefix_2>\()                 # begin
+                        (?P<const_count>[+*?])?         # argument count.
                         (?:(?P<const_arg>%N+?)=)?       # optional argument name
                         (?P<const_options>%N+?)         # constant phrase
                         (?:\?(?P<const_name>%N+?))?     # optional helptext
                     (?P<suffix_2>\)))                   # end
                     | # Or a constant w/o parenthesis
                     (?:
+                        (?P<const_count_1>[+*?])?       # argument count
                         (?:(?P<const_arg_1>%N+?)=)?     # optional argument name
                         (?P<const_options_1>%N+?)       # constant phrase
                         (?:\?(?P<const_name_1>%N+?))?   # helptext
@@ -426,8 +431,9 @@ class Binding:
         usage = []      # Usage line.  (Starts as a list, combined to a string later.)
         eol = False          # True after we've consumed a parameter that eats the remainder of the line.
 
-        index = -1
-        for match in self._paramstring_re.finditer(paramstring):
+        # index = -1
+        was_required = True  # Was the last parameter required?  (For error handling)
+        for index, match in enumerate(self._paramstring_re.finditer(paramstring)):
             options = match.group('options')
             if options is not None:
                 for ix, ch in enumerate(options):
@@ -444,7 +450,7 @@ class Binding:
                         continue
                     raise ParseError("Unrecognized option {!r}".format(ch))
                 continue
-            index += 1
+            # index += 1
             if eol:
                 raise parse_error_here(
                     "Previous parameter consumes remainder of line, cannot have additional parameters."
@@ -474,8 +480,10 @@ class Binding:
             arg = data.get('arg') or None
             options = data.get('options')
             name = data.get('name')
-            listmode = Parameter.LIST_NONE
+            count = data.get('count', '')
             required = True
+            if required and not was_required:
+                raise parse_error_here("Cannot have mandatory arguments after optional ones.")
 
             if paramtype == 'const':
                 type_ = 'const'
@@ -484,11 +492,17 @@ class Binding:
                 type_ = data.get('type') or self.default_type
                 name = name or arg
 
+            if count and count in '+*':
+                listmode = Parameter.LIST_NORMAL  # we might override this in a moment, but that's fine.
+            else:
+                listmode = Parameter.LIST_NONE
+            required = not count or count not in '?*'
+
             if arg:
-                if arg[-1] in '+*':
-                    listmode = Parameter.LIST_NORMAL  # we might override this in a moment that's fine.
-                    required = (arg[-1] == '+')
-                    arg = arg[:-1]
+                # if arg[-1] in '+*':
+                #     listmode = Parameter.LIST_NORMAL  # we might override this in a moment that's fine.
+                #     required = (arg[-1] == '+')
+                #     arg = arg[:-1]
                 if arg in arg_names:
                     raise parse_error_here("Duplicate parameter name '{!r}'".format(arg))
                 if arg == varargs_var:
@@ -498,9 +512,10 @@ class Binding:
                 if arg not in signature.parameters:
                     if not kwargs_var:
                         raise parse_error_here("Bound function has no argument named '{!r}'".format(arg))
-                    required = False
+                    # required = False
                 elif not listmode:
-                    required = (signature.parameters[arg].default is inspect.Parameter.empty)
+                    # required = (signature.parameters[arg].default is inspect.Parameter.empty)
+                    pass
                 arg_names.add(arg)
             try:
                 param = Parameter(self, index, arg, type_, options, name, listmode, required)
@@ -552,8 +567,19 @@ class Binding:
                 args = list(args) + [self]
             else:
                 kwargs[self.binding_arg] = self
+        if (
+                        len(invocation.arglist) > len(self.params) and
+                    (not self.params or not (self.params[-1].eol or self.params[-1].listmode))
+        ):
+            raise UsageError("Incorrect number of arguments.")
+
+        for param in self.params:
+            param.validate(invocation.arglist)
+
         for param in self.params:
             param.bind(invocation.arglist, args, kwargs)
+            # Did we get too many arguments?
+
         return self.signature.bind(invocation, *args, **kwargs)
 
     def __call__(self, invocation, *args, **kwargs):
@@ -627,7 +653,7 @@ class Parameter:
 
         :param arglist: A :class:`ArgumentList`
         """
-        if len(arglist) >= self.index:
+        if len(arglist) <= self.index:
             if self.required:
                 if self.listmode:
                     raise UsageError("At least one {name} must be specified".format(name=self.name or '<const>'))

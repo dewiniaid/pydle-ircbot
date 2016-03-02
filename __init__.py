@@ -658,7 +658,7 @@ class Event(ircbot.commands.Invocation):
         return getattr(self.bot, item)
 
 
-def help_command(event, name=None):
+def help_command(event, name=None, full=False):
     """
     Produces help.
     :param event: Event
@@ -666,6 +666,13 @@ def help_command(event, name=None):
     """
     registry = event.bot.command_registry
     reply = functools.partial(event.notice, target=event.nick)
+
+    def usage_lines(c, name):
+        for ix, binding in enumerate(c.bindings):
+            fmt = "{name} {binding.usage}"
+            if binding.summary:
+                fmt += " -- {binding.summary}"
+            yield fmt.format(name=name, binding=binding)
 
     if name:
         search = registry.parse(name)
@@ -681,14 +688,11 @@ def help_command(event, name=None):
                 .format(name=name, help_command=event.full_name)
             )
             return
-        for ix, binding in enumerate(command.bindings):
-            fmt = "{usage} {name} {binding.usage}"
-            if binding.summary:
-                fmt += " -- {binding.summary}"
-            reply(fmt.format(usage="      " if ix else "Usage:", name=name, binding=binding))
-            if command.doc:
-                reply(command.doc)
-
+        usage_string = "Usage: "
+        for index, line in enumerate(usage_lines(command, name)):
+            reply(((' ' * len(usage_string)) if index else usage_string) + line)
+        if command.doc:
+            reply(command.doc)
         return
 
     # Build a wordwrapper for formatting the command list.
@@ -705,6 +709,12 @@ def help_command(event, name=None):
         sorted(commands, key=lambda item: ((item.category or "").lower(), item.name)),
         key=lambda item: (item.category or "").lower()
     ):
+        if full:
+            for command in commandlist:
+                for line in usage_lines(command, event.prefix + command.name):
+                    reply(line)
+            continue
+
         fmt = ("[{category}]: " if category else "") + "{commands}"
         for line in ww(fmt.format(
             category=category.upper(),
@@ -713,11 +723,32 @@ def help_command(event, name=None):
             reply(line)
 
 
-def add_help_command(bot, name='help'):
-    pending = commands.bind(
-        help_command, '[<name?command>]', 'Shows a list of commands or detailed help on one command.'
+def add_help_command(bot, fn=None, allow_full=True, **kwargs):
+    """
+    Adds the default help command (or potentially a different command) to a bot
+    :param bot: Bot instance to add the command to.
+    :param fn: Function to bind.  Defaults to :func:`help_command`()
+    :param allow_full: If TRUE, allow HELP FULL
+    :param kwargs: Passed to :class:`commands.Command`
+    """
+    if fn is None:
+        fn = help_command
+
+    kwargs.setdefault('name', 'help')
+
+    bindings = kwargs.setdefault('bindings', [])
+    if allow_full:
+        bindings.append(
+            commands.Binding(fn, '[?full=FULL]', 'Shows a list of commands.  FULL shows usage for all commands.')
+        )
+    else:
+        bindings.append(
+            commands.Binding(fn, '', 'Shows a list of commands.')
+        )
+    bindings.append(
+        commands.Binding(fn, '<name?command>', 'Shows detailed help on one command.')
     )
-    bot.command(pending, name)
+    bot.command_registry.register(commands.Command(**kwargs))
 
 
 class Throttle:
