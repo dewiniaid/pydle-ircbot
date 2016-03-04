@@ -1073,11 +1073,9 @@ class Command:
             registry.register(created)
         return created
 
-    def finish(self, altname=None):
+    def finish(self):
         """
         Called by decorators when the command is fully assembled.
-
-        :param altname: Alternate name if all fallbacks fail.
         """
         if self._done:
             return
@@ -1085,15 +1083,8 @@ class Command:
             if hasattr(pattern, 'pattern'):  # Compiled regex.
                 continue
             self.patterns[ix] = re.compile(pattern, re.IGNORECASE)
-        if not self.name:
-            if self.aliases:
-                self.name = self.aliases[0]
-            elif self.patterns:
-                self.name = self.patterns[0]
-                if hasattr(self.name, 'pattern'):
-                    self.name = self.name.pattern
-            else:
-                self.name = altname
+        if not self.name and self.aliases:
+            self.name = self.aliases[0]
 
     def __call__(self, invocation, *args, **kwargs):
         """
@@ -1123,19 +1114,15 @@ class Command:
         raise error
 
     @classmethod
-    def from_pending(cls, pending, registry=None, altname=_default, **kwargs):
+    def from_pending(cls, pending, registry=None, **kwargs):
         """
         Create a new instance from a :class:`PendingCommand`
 
         :param pending: A PendingCommand instance.
         :param registry: If non-None, a :class:`Registry` to register the new command with.
-        :param altname: Alternative fallback name.
         :param kwargs: Additional arguments to pass to constructor.  May be merged with PendingCommand arguments.
         :return: The new command
         """
-        # Figure out altname if defaulted.
-        if altname is _default:
-            altname = pending.function.__name__
         # Merge the various lists in reverse.  This allows decorators to be interpreted top-down even though they are
         # executed bottom-up.
         for attr in ('aliases', 'patterns', 'bindings'):
@@ -1150,7 +1137,7 @@ class Command:
         kwargs['doc'] = "\n".join(doc)
 
         rv = cls(**kwargs)
-        rv.finish(altname)
+        rv.finish()
         if registry:
             registry.register(rv)
         return rv
