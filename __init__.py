@@ -391,7 +391,7 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
 
     def command(self, *args, **kwargs):
         """
-        Same as :decorator:`ircbot.commands.command`, but using our command registry by default.
+        Same as :meth:`ircbot.commands.command`, but using our command registry by default.
 
         :param args: Passed to decorator
         :param kwargs: Passed to decorator
@@ -681,11 +681,15 @@ class Event(ircbot.commands.Invocation):
         """
         return self.channel or self.nick
 
+    @property
+    def user(self):
+        """
+        Returns the userdata for the triggering nick.
+        """
+        return self.bot.users.get(self.nick)
+
     def __getattr__(self, item):
         """Relay unknown attribute calls to the bot"""
         return getattr(self.bot, item)
-        """
-        """
-
 
 

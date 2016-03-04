@@ -9,24 +9,24 @@ Argument Parsing
 Argument parsing works on the notion of splitting a string of space-separated words, but with an easy way to take any
 word and retrieve the remainder of the string that was originally parsed.
 
-The :class:`ArgumentList` class parses a line of text and converts it into a list of :class:`Argument`s.  Arguments
-are subclasses of :class:`str` that add some extra fluff -- namely, the :attr:`~Argument.eol` property which returns
-from the beginning of the selected argument up through the end of the line that was parsed.  This is notably useful
-for commands that take a few 'word' arguments followed by a partial line of text.
+The :class:`ArgumentList` class parses a line of text and converts it into a list of :class:`Arguments <Argument>`.
+Arguments are subclasses of :class:`str` that add some extra fluff -- namely, the :attr:`~Argument.eol` property which
+returns from the beginning of the selected argument up through the end of the line that was parsed.  This is notably
+useful for commands that take a few 'word' arguments followed by a partial line of text.
 
 Command Binding
 ===============
 Command binding is the process of taking a particular set of arguments (in a :class:`ArgumentList`), interpreting them,
 and calling a function with said arguments.
 
-The definition of a particular :class:`CommandBinding` is written in a simple syntax that resembles the same sort of
+The definition of a particular :class:`Binding` is written in a simple syntax that resembles the same sort of
 text you might write as a one-line "Usage: " instruction, e.g. something like::
 
-   CommandBinding("set <key> <value>")
+   Binding("set <key> <value>")
 
 Which will call a function using function(key=word, value=word)
 
-The :class:`CommandBinding` interface is designed in such a way where a command ultimately can have multiple unique
+The :class:`Binding` interface is designed in such a way where a command ultimately can have multiple unique
 bindings for various subcommands.
 
 Commands
@@ -53,7 +53,7 @@ from ircbot.util import listify
 __all__ = [
     'Argument', 'ArgumentList',
     'Binding', 'ParamType', 'ConstParamType', 'StrParamType', 'NumberParamType',
-    'UsageError', 'FinalUsageError', 'ParseError', 'ParseResult'
+    'UsageError', 'FinalUsageError', 'ParseError',
     'Command', 'PendingCommand', 'wrap_decorator', 'chain_decorator', 'command', 'alias', 'bind', 'match', 'doc'
 ]
 
@@ -128,12 +128,16 @@ class ArgumentList(list):
 class ParseError(ValueError):
     """
     Represents an error in parsing :class:`CommandBinding` syntax.
-
-    :ivar message: Error message.
-    :ivar text: Text being parsed.
-    :ivar pos: Position of error, if known.
     """
     def __init__(self, message=None, text=None, pos=None):
+        """
+        Creates a new :class:`ParseError`
+
+        :param message: Error message
+        :param text: Line of text where error occured.
+        :param pos: Character position on line.
+        :return:
+        """
         self.message = message
         self.text = text
         self.pos = pos
@@ -242,9 +246,9 @@ class Binding:
     """
     A given IRC command can have one or more bindings.
     A binding consists of:
-        - A function to call
-        - A priority (default 0)
-        - A parameter string, consisting of a a space-separated list of variables, constants, and options
+    - A function to call
+    - A priority (default 0)
+    - A parameter string, consisting of a a space-separated list of variables, constants, and options
 
     If the first word of a line of text matches one of the command names, the remainder is checked against the bindings
     available for that command in order of priority.  (Bindings with the same priority are called in the order they
@@ -255,81 +259,95 @@ class Binding:
 
     Approximate ABNF syntax for parameter strings:
 
-    SPACE = 1*(WSP / CR / LF)
+    ::
 
-    param-string = param *(SPACE param)
-    param = (*"[" (variable | constant) *"]") / option
-    word = 1*(ALPHA / DIGIT)
-    name = 1*WORD
-    type = 1*WORD
-    help = 1*WORD
-    type-specifier = ":" type
-    help-specifier = "?" [help]
-    const-phrase-separator = "/" / "|"
-    const-phrase = WORD 1*(const-separator WORD)
-    constant = bare-constant / parenthesized-constant
-    bare-constant = [name "="] const-phrase [help-specifier]
-    parenthesized-constant = "(" bare-constant ")"
+        SPACE = 1*(WSP / CR / LF)
 
-    variable = "<" name [type-specifier] [help-specifier] ">"
+        param-string = param *(SPACE param)
+        param = (*"[" (variable | constant) *"]") / option
 
-    option = "/" 1*ALPHA
+        word = 1*(ALPHA / DIGIT)
+        name = 1*WORD
+        type = 1*WORD
+        help = 1*WORD
+        type-specifier = ":" type
+        help-specifier = "?" [help]
+        const-phrase-separator = "/" / "|"
+        const-phrase = WORD 1*(const-separator WORD)
+        constant = bare-constant / parenthesized-constant
+        bare-constant = [name "="] const-phrase [help-specifier]
+        parenthesized-constant = "(" bare-constant ")"
 
-    Constants:
-    ----------
+        variable = "<" name [type-specifier] [help-specifier] ">"
+
+        option = "/" 1*ALPHA
+
+    **Constants:**
+
     Constants are optionally wrapped in parenthesis.  They consist of the following, in order:
     - An optional argument name, followed by an equals sign, which will receive a lowercased version of the constant.
     - One or more words, separated by the | or / characters.  Text has to be a (case-insensitive) match to one of the
-      listed words.
+    listed words.
     - An optional helpname, consisting of a question mark (?) followed by text that should be used in place of the
-      variable name in help.  This may contain spaces as long as the constant is wrapped in parenthesis.
+    variable name in help.  This may contain spaces as long as the constant is wrapped in parenthesis.
 
     Examples:
 
-    foo - Word must exactly match 'foo'
-    action=add|delete - Word must be 'add' or 'delete', and the function's 'action' argument will match the word.
-    (action=add|delete?ACTION) - As above, but will show as ACTION in helptext.
-
+    ``foo``
+        Word must exactly match 'foo'
+    ``action=add|delete``
+        Word must be 'add' or 'delete', and the function's 'action' argument will match the word.
+    ``(action=add|delete?ACTION)``
+        As above, but will show as ACTION in helptext.
 
     When a constant is present, parsing expects an exact (case-insensitive) match to one of the words listed:
-    foo
+
+    ``foo``
         Word must be 'foo'
-    foo|bar or foo/bar
+    ``foo|bar or foo/bar``
         Word must be 'foo' or 'bar'
 
-    A constant may be optionally preceded with "name=".  If so, the variable named 'name' will be set to the constant
+    A constant may be optionally preceded with "name=".  If so, the parameter named *name* will be set to the constant
     value when calling the function.
 
+    **Variables:**
 
-    Variables:
-    ----------
     Variables are wrapped in angle brackets and normally correspond 1-to-1 with words in the text being processed.
     They consist of the following, in order:
-    - A name, which must match the name of a function argument (unless the function has **kwargs)
+
+    - A name, which must match the name of a function argument (unless the function has `kwargs`)
     - An optional type specifier, consisting of a colon (:) plus the name of a type.  Currently supported types are:
-        :line - Matches the rest of the line instead of the usual one word.  Should be the last parameter.
-        :str - Input coerced to string.  This is the default.
-        :int - Input coerced to integer.
+      - ``:line`` - Matches the rest of the line instead of the usual one word.  Should be the last parameter.
+      - ``:str`` - Input coerced to string.  This is the default.
+      - ``:int`` - Input coerced to integer.
     - An optional helpname, consisting of a question mark (?) followed by text that should be used in place of the
       variable name in help.  This may contain spaces.
 
-    The variable name may be preceded by a '*' or a '+' to indicate that it should receive the remaining arguments as a
-    list.  If this is the case, it must be the final parameter.  If the variable name is the same as the name of the
-    *args parameter in the function, '*' is implied if neither option is specified.  '*' means it must have 0 or more
-    arguments, '+' is 1 or more..
+    The variable name may also be preceded by one of the following:
 
-    Alternatively, the variable name may be preceded by a '?' to indicate that it is optional.
+    ``*``
+        Produces a list of 0..*N* items.  Must be the last parameter.
+    ``+``
+        Produces a list of 1..*N* items.  Must be the last parameter.
+    ``?``
+        Optional variable.  The function's default value will be used if the variable is not present.
 
-    Options:
-    ----------
+    **Options:**
+
     Options begin with a "/", and the remaining text sets various options.
 
     Current options are:
-    b: When invoking the bound function, pass this binding to it.  This is passed the first argument (before any *args)
-    B: As 'b', but as the argument after *args
-    b=keyword: Pass the binding as this keyword to the bound function.
-    u: If present and all bindings raise a UsageError, use this one's usage error rather than the first UsageError
-    raised.
+
+    b
+        When invoking the bound function, pass this binding to it.  This is passed the first argument (before any
+        `args`)
+    B
+        As 'b', but as the argument after `args`
+    b=keyword
+        Pass the binding as this keyword to the bound function.
+    u
+        f present and all bindings raise a UsageError, use this one's usage error rather than the first UsageError
+        raised.
 
     Optional parameters:
     Each chunk may optionally begin with any number of ['s and end with any number of ]'s to indicate that they are
@@ -627,7 +645,7 @@ class Parameter:
         :param options: Parameter type options.
         :param name: Helpname.  Defaults to 'arg' if not set.
         :param listmode: LIST_NONE(default) if this is a single argument.  LIST_NORMAL if this is a list of arguments.
-            LIST_VARARGS if this is a function's *args
+            LIST_VARARGS if this is a function's args
         :param required: True if this parameter is required.  For lists, this means it must match 1+ items instead of
             0+ items.
         """
@@ -722,20 +740,21 @@ class ParamType:
     Defines logic and rules behind argument parsing.
 
     There's three passes to argument parsing:
-    1. At bind time, an ArgumentType() instance is created.  It receives any options specified as its first argument.
 
-    2. Before calling a function, any arguments that have 'check=True' have their validate method called.  If any of
-       them raise the function will not be called and the system will continue to the next binding (if one exists)
+    1. At bind time, a `ParamType` instance is created.  It receives any options specified as its first argument.
 
-    3. Before calling a function, all arguments have their parse() method called, and the result is assigned to one of
-       the function arguments.  If any of these raise, the function will not be called. and the system will continue
-       to the next binding (if one exists)
+    2. Before calling a function, any arguments that have :attr:`check` = *True* have their validate method called.  If
+       any of them raise the function will not be called and the system will continue to the next binding (if one
+       exists)
+
+    3. Before calling a function, all arguments have their :meth:`parse` method called, and the result is assigned to
+       one of the function arguments.  If any of these raise, the function will not be called. and the system will
+       continue to the next binding (if one exists)
 
     :ivar eol: If True, this argument type consumes the entire line instead of just one word.
     :ivar wrap_exceptions: If True, all non-UsageError exceptions from cls.parse() are re-raised as UsageErrors.
     :ivar check: If True, call validate() before parse().  Use this when the parsing may have side effects or
         would be otherwise expensive, but simple validation is easy.
-    :ivar param: Options passed by the CommandBinding process.  Not currently implemented.
     """
     eol = False
     wrap_exceptions = True
@@ -1017,17 +1036,18 @@ class Command:
     Represents commands.
 
     In addition to constructing commands using this class, they can also be constructed using the decorator syntax with
-    :decorator:`command`, :decorator:`bind`, :decorator:`alias`, :decorator:`match`, :decorator:`doc`.
+    :func:`command`, :func:`bind`, :func:`alias`, :func:`match`, :func:`doc`.
 
-    These are designed in such a way to account for the fact that they run 'backwards', e.g:
+    These are designed in such a way to account for the fact that they run 'backwards', e.g::
 
-    @command('memo')
-    @bind('action=add <message:text>')
-    @bind('action=del/delete <message:text>')
-    def myfunction(..., action, message):
-        pass
+        @command('memo')
+        @bind('action=add <message:text>')
+        @bind('action=del/delete <message:text>')
+        def myfunction(..., action, message):
+            pass
 
-    Despite the fact that the second @bind is called first, the binds will be in the 'logical' order of top to bottom.
+    Despite the fact that the second ``@bind`` is called first, the binds will be in the 'logical' order of top to
+    bottom.
     """
     name = None      # Command name for !help
     aliases = []     # Aliases.  (Case-insensitive string matching)
@@ -1104,7 +1124,7 @@ class Command:
 
         :param invocation: A :class:`Invocation` instance representing information we were called with.
 
-        All arguments are passed to `CommandBinding.__call__`
+        All arguments are passed to `Binding.__call__`
         """
         if not self.bindings:
             raise ValueError("Command has no bindings")
@@ -1249,7 +1269,7 @@ def command(
     :param registry: Which :class:`CommandRegistry` the command will be registered in.  None disables registration.
     :param factory: A :class:`Command` subclass or a function that will create the new command.
     :param return_command: If True, returns the new command object rather than the wrapped function.
-    :param **kwargs: Passed to factory.
+    :param kwargs: Passed to factory.
     :return: the new :class:`Command` object if return_command is True, otherwise fn.function or fn
     """
     if not isinstance(fn, PendingCommand):
@@ -1271,7 +1291,8 @@ def command(
 @chain_decorator
 def bind(fn, paramstring='', summary=None, label=None, precheck=None, wrapper=None, function=None):
     """
-    Adds a :class:`CommandBinding` to the pending command.  See that class for details on arguments.
+    Adds a :class:`Binding` to the pending command.  See that class for details on arguments.
+
     :param fn: Function to decorate, or a :class:`PendingCommand` instance.
     :param paramstring: Parameter string.
     :param summary: Optional usage summary for help.
@@ -1293,9 +1314,9 @@ def bind(fn, paramstring='', summary=None, label=None, precheck=None, wrapper=No
 def alias(fn, *aliases):
     """
     Adds one or more aliases (exact string matches) to the pending command.
+
     :param fn: Function to decorate, or a :class:`PendingCommand` instance.
     :param aliases: One or more aliases to add.
-    :return:
     """
     fn.aliases.extend(reversed(aliases))
 
@@ -1304,9 +1325,9 @@ def alias(fn, *aliases):
 def match(fn, *patterns):
     """
     Adds one or more patterns (regex matches) to the pending command.
+
     :param fn: Function to decorate, or a :class:`PendingCommand` instance.
     :param patterns: One or more aliases to add.
-    :return:
     """
     fn.patterns.extend(reversed(patterns))
 
@@ -1315,8 +1336,8 @@ def match(fn, *patterns):
 def doc(fn, helptext):
     """
     Adds helptext to the pending command.
+
     :param fn: Function to decorate, or a :class:`PendingCommand` instance.
     :param helptext: Helptext to add.
-    :return:
     """
     fn.doc.append(helptext)

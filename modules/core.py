@@ -5,10 +5,14 @@ To add commands in this module with their default settings, simply register them
 
 To override settings, use command.export(...) or set the appropriate class attributes before registering them.
 
-help_command - Adds !help.
-    allow_full=True - Allow !help full (which can be very spammy with a lot of commands loaded)
-    reply=default_reply - Function that takes an event and a message and produces the appropriate reply.  The default
-        implementation sends a NOTICE to the target nick.
+`help_command`
+    Adds ``!help.``  Common options are:
+
+    ``allow_full=True``
+        Allow !help full (which can be very spammy with a lot of commands loaded)
+    ``reply=default_reply``
+        Function that takes an event and a message and produces the appropriate reply.  The default implementation
+        sends a NOTICE to the target nick.
 """
 from ircbot.commands import Command, command, alias, bind, doc
 import functools
