@@ -1,13 +1,13 @@
 import pydle
 from pydle.features.rfc1459 import protocol
-from pydle.features.whox import WHOX_IDENTIFIER, NO_ACCOUNT
 from pydle.async import Future, parallel
 import pydle.features
 
 
+
 def dummy_future(result=None):
     """
-    Creates a future with a predetermined result.  Used for cases where we may return a 'real' future but sometimes
+    Creates a future with a predetermined result.  Used for cases where we might return a 'real' future but sometimes
     we can resume immediately.
     :return: Created future.
     """
@@ -17,7 +17,6 @@ def dummy_future(result=None):
 
 
 class UserTrackingClient(pydle.featurize(pydle.features.AccountSupport, pydle.features.RFC1459Support)):
-    # TODO: Make this more sane on what features it requires.
     def _create_user(self, nickname):
         super()._create_user(nickname)
         if nickname in self.users:
