@@ -1,8 +1,10 @@
+"""Improved usertracking capabilities."""
 import pydle
 from pydle.features.rfc1459 import protocol
 from pydle.async import Future, parallel
 import pydle.features
-
+# Portions of UserTrackingClient are directly derived from code in Pydle and thus are subject to its license.
+# The Pydle license and related information can be found in LICENSE.md
 
 
 def dummy_future(result=None):
