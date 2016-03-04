@@ -14,10 +14,8 @@ import sys
 import textwrap
 import threading
 import traceback
-import itertools
-import operator
 import pydle
-
+import ircbot.usertrack
 import ircbot.commands
 
 
@@ -284,7 +282,7 @@ for _attr in filter(lambda x: x.startswith('on_') and not x.startswith('on_raw_'
 del _add_emitter
 
 
-class Bot(EventEmitter):
+class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
     def __init__(self, config=None, filename=None, data=None, **kwargs):
         """
         Creates a new Bot.
@@ -300,6 +298,8 @@ class Bot(EventEmitter):
             config = Config(filename=filename, data=data)
         self.config = config
         main = self.config['main']
+
+        self.event_factory = kwargs.pop('event_factory', Event)
 
         kwargs.setdefault('nickname', main.nicknames[0])
         kwargs.setdefault('fallback_nicknames', main.nicknames[1:])
@@ -517,7 +517,7 @@ class Bot(EventEmitter):
         super().on_message(target, nick, message)
         channel = target if self.is_channel(target) else None
         factory = functools.partial(
-            Event, bot=self, irc_command=irc_command, nick=nick, channel=channel, message=message
+            self.event_factory, bot=self, irc_command=irc_command, nick=nick, channel=channel, message=message
         )
 
         for pattern, fn in self.rules:
@@ -557,7 +557,20 @@ def _implied_target(method):
     return wrapper
 
 
-# noinspection PyIncorrectDocstring
+def _implied_target_user(method):
+    """
+    If 'target' is specified as a keyword argument, uses it.  Otherwise, determines it from nick and channel.
+
+    :param method: Method to wrap
+    :return: Wrapped method
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        target = kwargs.pop('target', None) or self.nick
+        return method(self, target, *args, **kwargs)
+    return wrapper
+
+
 class Event(ircbot.commands.Invocation):
     """
     Passed to command and rule functions when magic happens.
@@ -609,10 +622,23 @@ class Event(ircbot.commands.Invocation):
 
     say = message
 
+    @_implied_target_user
+    def umessage(self, *args, **kwargs):
+        """bot.message, but messaging the sender (not the channel) by default"""
+        return self.bot.message(*args, **kwargs)
+
+    usay = umessage
+
     @_implied_target
     def notice(self, *args, **kwargs):
         """bot.notice with a default target"""
         return self.bot.notice(*args, **kwargs)
+
+    @_implied_target_user
+    def unotice(self, *args, **kwargs):
+        """bot.notice, but messaging the sender (not the channel) by default"""
+        return self.bot.notice(*args, **kwargs)
+
 
     @_implied_target
     def action(self, *args, **kwargs):
@@ -658,99 +684,7 @@ class Event(ircbot.commands.Invocation):
         return getattr(self.bot, item)
 
 
-def help_command(event, name=None, full=False):
-    """
-    Produces help.
-    :param event: Event
-    :param name: Optional command name to search for.
-    """
-    registry = event.bot.command_registry
-    reply = functools.partial(event.notice, target=event.nick)
-
-    def usage_lines(c, name):
-        for ix, binding in enumerate(c.bindings):
-            fmt = "{name} {binding.usage}"
-            if binding.summary:
-                fmt += " -- {binding.summary}"
-            yield fmt.format(name=name, binding=binding)
-
-    if name:
-        search = registry.parse(name)
-        if search.command:
-            command = search.command
-            name = search.full_name
-        else:
-            command = registry.lookup(name)
-            name = event.prefix + name
-        if not command:
-            reply(
-                "Unknown command {name}.  See {help_command} for a complete list of commands"
-                .format(name=name, help_command=event.full_name)
-            )
-            return
-        usage_string = "Usage: "
-        for index, line in enumerate(usage_lines(command, name)):
-            reply(((' ' * len(usage_string)) if index else usage_string) + line)
-        if command.doc:
-            reply(command.doc)
-        return
-
-    # Build a wordwrapper for formatting the command list.
-    ww = textwrap.TextWrapper(
-        width=80, subsequent_indent="... "
-    ).wrap
-
-    # Build unique list of commands
-    commands = set(itertools.chain(registry.aliases.values(), registry.patterns.values()))
-
-    reply("For detailed help on a specific command, use {} <command>".format(event.full_name))
-    # Sort it and group by category
-    for category, commandlist in itertools.groupby(
-        sorted(commands, key=lambda item: ((item.category or "").lower(), item.name)),
-        key=lambda item: (item.category or "").lower()
-    ):
-        if full:
-            for command in commandlist:
-                for line in usage_lines(command, event.prefix + command.name):
-                    reply(line)
-            continue
-
-        fmt = ("[{category}]: " if category else "") + "{commands}"
-        for line in ww(fmt.format(
-            category=category.upper(),
-            commands=", ".join(command.name for command in commandlist))
-        ):
-            reply(line)
-
-
-def add_help_command(bot, fn=None, allow_full=True, **kwargs):
-    """
-    Adds the default help command (or potentially a different command) to a bot
-    :param bot: Bot instance to add the command to.
-    :param fn: Function to bind.  Defaults to :func:`help_command`()
-    :param allow_full: If TRUE, allow HELP FULL
-    :param kwargs: Passed to :class:`commands.Command`
-    """
-    if fn is None:
-        fn = help_command
-
-    kwargs.setdefault('name', 'help')
-
-    bindings = kwargs.setdefault('bindings', [])
-    if allow_full:
-        bindings.append(
-            commands.Binding(fn, '[?full=FULL]', 'Shows a list of commands.  FULL shows usage for all commands.')
-        )
-    else:
-        bindings.append(
-            commands.Binding(fn, '', 'Shows a list of commands.')
-        )
-    bindings.append(
-        commands.Binding(fn, '<name?command>', 'Shows detailed help on one command.')
-    )
-    bot.command_registry.register(commands.Command(**kwargs))
-
-
+# noinspection PyIncorrectDocstring
 class Throttle:
     """
     Implements a tunable throttling mechanism, e.g. for ensuring we don't flood IRC too much.

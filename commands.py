@@ -48,6 +48,8 @@ import collections
 import functools
 import itertools
 
+from ircbot.util import listify
+
 __all__ = [
     'Argument', 'ArgumentList',
     'Binding', 'ParamType', 'ConstParamType', 'StrParamType', 'NumberParamType',
@@ -389,7 +391,7 @@ class Binding:
     FIRST_ARG = object()
     LAST_ARG = object()
 
-    def __init__(self, function, paramstring, summary=None, label=None, command=None):
+    def __init__(self, function, paramstring, summary=None, label=None):
         """
         Creates a new :class:`CommandBinding`.
 
@@ -405,7 +407,6 @@ class Binding:
         self.summary = summary
         self.binding_arg = None
         self.default_error = False
-        self.command = None
 
         signature = self.signature
 
@@ -594,6 +595,7 @@ class Binding:
         :return: Result of function call.
         """
         bound = self.bind(invocation, *args, **kwargs)
+        invocation.binding = self
         return self.function(*bound.args, **bound.kwargs)
 
 
@@ -639,8 +641,7 @@ class Parameter:
 
         :param arglist: A :class:`ArgumentList`
         """
-        index = self.index
-        while index < len(arglist):
+        for index in range(self.index, len(arglist)):
             yield arglist[index]
             if not self.listmode:
                 return
@@ -940,20 +941,21 @@ class Registry:
         self.patterns = {}
         self.separator = separator
 
-    def register(self, command):
+    def register(self, *commands):
         """
-        Adds a command to the registry.
+        Adds one or more commands to the registry.
 
-        :param command: Command to add.
+        :param commands: Command(s) to add.
         """
-        aliases = set(alias.lower() for alias in command.aliases)
-        if command.name:
-            aliases.add(command.name)
-        for alias in aliases:
-            if alias in self.aliases:
-                raise ValueError("Duplicate command alias {!r}".format(alias))
-        self.aliases.update(zip(aliases, itertools.repeat(command)))
-        self.patterns.update(zip(command.patterns, itertools.repeat(command)))
+        for command in commands:
+            aliases = set(alias.lower() for alias in command.aliases)
+            if command.name:
+                aliases.add(command.name.lower())
+            for alias in aliases:
+                if alias in self.aliases:
+                    raise ValueError("Duplicate command alias {!r}".format(alias))
+            self.aliases.update(zip(aliases, itertools.repeat(command)))
+            self.patterns.update(zip(command.patterns, itertools.repeat(command)))
 
     def lookup_all(self, search):
         """
@@ -996,8 +998,6 @@ class Registry:
         search, text, *_ = itertools.chain(self.separator.split(text[match.end(0):], 1), ['']*2)
         return factory(prefix=prefix, name=search, command=self.lookup(search), text=text)
 
-DEFAULT_REGISTRY = Registry(prefix='!')
-
 
 # noinspection PyShadowingNames
 class Command:
@@ -1005,7 +1005,7 @@ class Command:
     Represents commands.
 
     In addition to constructing commands using this class, they can also be constructed using the decorator syntax with
-    :decorator:`command`, :decorator:`alias`, :decorator:`match`, :decorator:`help`.
+    :decorator:`command`, :decorator:`bind`, :decorator:`alias`, :decorator:`match`, :decorator:`doc`.
 
     These are designed in such a way to account for the fact that they run 'backwards', e.g:
 
@@ -1043,6 +1043,36 @@ class Command:
         self.usage = usage
         self.category = category
 
+    def export(self, registry=None, **kwargs):
+        """
+        Makes a copy of this command with updated attributes and optionally registers it.
+
+        The copy will be partially shallow: All lists will be duplicated, but their objects will not.  Thus, updating
+        a binding will update all copies, but removing a binding from a list will only affect that command's list.
+
+        :param registry: If not-None, points to a :class:`Registry` that the new command will be registered with
+        :param kwargs: Arguments to pass to the new command's constructor.  Omitted arguments will be set from the
+            current command.
+        :return: The new :class:`Command` object.
+        """
+        # Attributes we directly assign
+        for attr in ('name', 'doc', 'usage', 'category'):
+            kwargs.setdefault(attr, getattr(self, attr))
+
+        # Attributes we make shallow copies of
+        for attr in ('aliases', 'patterns', 'bindings'):
+            if attr in kwargs:
+                continue
+            kwargs[attr] = getattr(self, attr).copy()
+
+        done = kwargs.pop('_done', self._done)
+
+        created = self.__class__(**kwargs)
+        created._done = done
+        if registry:
+            registry.register(created)
+        return created
+
     def finish(self, altname=None):
         """
         Called by decorators when the command is fully assembled.
@@ -1051,8 +1081,6 @@ class Command:
         """
         if self._done:
             return
-        for binding in self.bindings:
-            binding.command = self
         for ix, pattern in enumerate(self.patterns):
             if hasattr(pattern, 'pattern'):  # Compiled regex.
                 continue
@@ -1094,6 +1122,39 @@ class Command:
             raise UsageError("Usage: {command} {usage}".format(command=invocation.full_name, usage=error_binding.usage))
         raise error
 
+    @classmethod
+    def from_pending(cls, pending, registry=None, altname=_default, **kwargs):
+        """
+        Create a new instance from a :class:`PendingCommand`
+
+        :param pending: A PendingCommand instance.
+        :param registry: If non-None, a :class:`Registry` to register the new command with.
+        :param altname: Alternative fallback name.
+        :param kwargs: Additional arguments to pass to constructor.  May be merged with PendingCommand arguments.
+        :return: The new command
+        """
+        # Figure out altname if defaulted.
+        if altname is _default:
+            altname = pending.function.__name__
+        # Merge the various lists in reverse.  This allows decorators to be interpreted top-down even though they are
+        # executed bottom-up.
+        for attr in ('aliases', 'patterns', 'bindings'):
+            kwargs[attr] = (kwargs.get(attr) or [])
+            kwargs[attr].extend(reversed(getattr(pending, attr) or []))
+        # Downright default some other attributes
+        for attr in ('category', 'usage'):
+            kwargs.setdefault(attr, getattr(pending, attr))
+        # doc is tricky.
+        doc = listify(kwargs.get('doc'))
+        doc.extend(reversed(pending.doc or []))
+        kwargs['doc'] = "\n".join(doc)
+
+        rv = cls(**kwargs)
+        rv.finish(altname)
+        if registry:
+            registry.register(rv)
+        return rv
+
 
 class PendingCommand:
     """
@@ -1103,12 +1164,13 @@ class PendingCommand:
     """
     def __init__(self, function):
         self.function = function
-        self.command = Command()
         # These all resemble the Command counterparts, but will be reversed upon being finalized.
         self.bindings = []
         self.patterns = []
         self.aliases = []
-        self.help = []
+        self.doc = []
+        self.usage = None
+        self.category = None
 
     def __call__(self, *args, **kwargs):
         return self.function(*args, **kwargs)
@@ -1168,7 +1230,7 @@ def chain_decorator(fn):
 @wrap_decorator
 def command(
     fn=None, name=None, aliases=None, patterns=None, bindings=None, doc=None, category=None, usage=None,
-    registry=DEFAULT_REGISTRY
+    registry=None, factory=Command, return_command=False, **kwargs
 ):
     """
     Command decorator.
@@ -1184,21 +1246,24 @@ def command(
     :param doc: Helptext.
     :param category: Category.
     :param registry: Which :class:`CommandRegistry` the command will be registered in.  None disables registration.
-    :return: fn.function or fn
+    :param factory: A :class:`Command` subclass or a function that will create the new command.
+    :param return_command: If True, returns the new command object rather than the wrapped function.
+    :param **kwargs: Passed to factory.
+    :return: the new :class:`Command` object if return_command is True, otherwise fn.function or fn
     """
     if not isinstance(fn, PendingCommand):
         fn = PendingCommand(fn)
-    c = fn.command
-    c.name = name
-    c.category = category
-    c.usage = usage
-    c.aliases = (aliases or []) + list(reversed(fn.aliases))
-    c.patterns = (patterns or []) + list(reversed(fn.patterns))
-    c.bindings = (bindings or []) + list(reversed(fn.bindings))
-    c.doc = "\n".join(([doc] if doc else []) + list(reversed(fn.help)))
-    c.finish(altname=fn.function.__name__)
-    if registry:
-        registry.register(c)
+
+    if hasattr(factory, 'from_pending'):
+        factory = factory.from_pending
+
+    created = factory(
+        fn, registry,
+        name=name, category=category, usage=usage, aliases=aliases, patterns=patterns, bindings=bindings, doc=doc,
+        **kwargs
+    )
+    if return_command:
+        return created
     return fn.function
 
 
@@ -1245,4 +1310,4 @@ def doc(fn, helptext):
     :param helptext: Helptext to add.
     :return:
     """
-    fn.help.append(helptext)
+    fn.doc.append(helptext)
