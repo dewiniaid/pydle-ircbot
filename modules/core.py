@@ -21,9 +21,21 @@ def default_reply(event, message):
 
 
 class HelpCommand(Command):
-    def __init__(self, *args, reply=default_reply, allow_full=True, **kwargs):
+    def __init__(self, *args, reply=default_reply, allow_full=True, command_filter=None, **kwargs):
+        """
+        Specialized HelpCommand data.
+
+        :param args: Passed to superclass
+        :param reply: Function that will be called for all help reply messages.
+        :param allow_full: If TRUE, allows !help full which shows usage for all commands.  Spammy.
+        :param command_filter: If not-None, a callable that receives a command and returns True if it should be
+            included in health.
+        :param kwargs: Passed to superclass.
+        :return:
+        """
         self.reply = reply
         self.allow_full = allow_full
+        self.command_filter = command_filter
         super().__init__(*args, **kwargs)
 
         # Remove the binding that doesn't match our allow_fullness.
@@ -43,6 +55,10 @@ def help_command(event, name=None, full=False):
     """
     registry = event.bot.command_registry
     reply = functools.partial(event.command.reply, event)
+    if event.command.command_filter:
+        command_filter = lambda x: x and x.name and event.bot.command_filter(x)
+    else:
+        command_filter = lambda x: x and x.name is not None
 
     def usage_lines(c, name):
         for ix, binding in enumerate(c.bindings):
@@ -53,15 +69,15 @@ def help_command(event, name=None, full=False):
 
     if name:
         search = registry.parse(name)
-        if search.command:
+        if search.command and search.command.name:
             command = search.command
             name = search.full_name
         else:
             command = registry.lookup(name)
             name = event.prefix + name
-        if not command:
+        if not command_filter(command):
             reply(
-                "Unknown command {name}.  See {help_command} for a complete list of commands"
+                "Unknown command {name}.  See {help_command} for a complete list of commands."
                 .format(name=name, help_command=event.full_name)
             )
             return
@@ -85,7 +101,7 @@ def help_command(event, name=None, full=False):
     ).wrap
 
     # Build unique list of commands
-    commands = set(itertools.chain(registry.aliases.values(), registry.patterns.values()))
+    commands = set(filter(command_filter, itertools.chain(registry.aliases.values(), registry.patterns.values())))
 
     reply("For detailed help on a specific command, use {} <command>".format(event.full_name))
     # Sort it and group by category
