@@ -7,16 +7,18 @@ command syntax.
 import collections
 import configparser
 import contextlib
-import datetime
 import functools
 import re
 import sys
 import textwrap
 import threading
 import traceback
+
 import pydle
-import ircbot.usertrack
+
 import ircbot.commands
+import ircbot.usertrack
+from ircbot.util import Throttle
 
 
 class ConfigSection(dict):
@@ -682,147 +684,8 @@ class Event(ircbot.commands.Invocation):
     def __getattr__(self, item):
         """Relay unknown attribute calls to the bot"""
         return getattr(self.bot, item)
-
-
-# noinspection PyIncorrectDocstring
-class Throttle:
-    """
-    Implements a tunable throttling mechanism, e.g. for ensuring we don't flood IRC too much.
-
-    This mechanism has two components: `burst`, which is the number of events we can trigger at once, and `rate`, which
-    is the amount of time required for to recover 1 event.
-
-    :ivar burst: Configured maximum burst.
-    :ivar rate: Recovery rate as a timedelta
-    :ivar free: How many events are currently available for bursting
-    :ivar next: The next time a tick should occur.  This may be greater than `rate` seconds away
-    :ivar queue: Event queue.  Events are tuples of (cost, callable)
-    :ivar on_clear: Function called if the queue is emptied.
-    :ivar handle: Handle for scheduling.  Exact use is determined by caller.
-
-    If rate is 0, has no actual throttling mechanics.
-    """
-    ZEROTIME = datetime.timedelta()
-
-    def __init__(self, burst, rate, on_clear=None):
         """
-        Creates a new Throttle.
-
-        :param burst: Maximum number of burstable events.  Should be at last 1
-        :param rate: Amount of time required before the number of available events recharges by 1, in seconds or as a
-            :class:`datetime.timedelta`.
-        :param on_clear: Function called when the queue is empty, or None
         """
-        self.burst = burst
-        if not isinstance(rate, datetime.timedelta):
-            rate = datetime.timedelta(seconds=rate)
-        self.rate = rate
-        self.free = burst
-        self.next = datetime.datetime.now() + rate
-        self.queue = collections.deque()
-        self.on_clear = on_clear
-        self.handle = None
 
-    def add(self, item, tick=False):
-        """
-        Adds the callable to the queue, and immediately ticks the queue if `tick` is set.
 
-        :param item: Callable to add, or a tuple of (cost, callable)
-        :param tick: If True, ticks the queue afterwards.
-        :returns: (possibly updated) self.next
-        """
-        if callable(item):
-            item = (1, item)
-        self.queue.append(item)
-        if tick:
-            self.tick()
-        return self.time_remaining()
 
-    def addexec(self, item):
-        """
-        Adds the callable to the queue, and immediately ticks the queue if possible.
-
-        :param item: Callable to add, or a tuple of (cost, callable)
-        """
-        return self.add(item, tick=True)
-
-    def extend(self, items, tick=False):
-        """
-        Adds the callables in items to the queue, and immediately ticks the queue if `tick` is set.
-
-        :param items: Sequence of callables to add.  Each item may also be a a tuple of (cost, callable)
-        :param tick: If True, ticks the queue afterwards.
-        """
-        self.queue.extend((1, x) if callable(x) else x for x in items)
-        if tick:
-            self.tick()
-        return self.time_remaining()
-
-    def extendexec(self, items):
-        """
-        Adds the callables in items to the queue, and immediately ticks the queue.
-
-        :param items: Sequence of callables to add.  Each item may also be a a tuple of (cost, callable)
-        """
-        return self.extend(items, tick=True)
-
-    def pop(self):
-        """
-        Pops the oldest item off the queue and calls it.
-
-        Returns False if the queue was empty.
-        """
-        if not self.queue:
-            return False
-        cost, fn = self.queue.popleft()
-        if not self.rate:
-            cost = 0
-        self.free -= cost
-        fn()
-        return True
-
-    def tick(self):
-        """
-        Ticks the queue.
-        """
-        if not self.rate:
-            while self.queue:
-                self.pop()
-            return None
-
-        if self.free >= self.burst:
-            # If we're at max, run the next command regardless of its cost.
-            if self.queue:
-                self.pop()
-                self.next = datetime.datetime.now() + self.rate
-        else:
-            # Determine how many ticks we can recover
-            n = max(0, min((datetime.datetime.now() - self.next) // self.rate, self.burst - self.free))
-            self.next += self.rate*n  # We'll get 1 tick by then.
-            self.free += n
-
-        while self.queue and self.next_cost() <= self.free:
-            self.pop()
-        remaining = self.time_remaining()
-        if remaining is None and self.on_clear:
-            self.on_clear()
-        return remaining
-
-    def next_cost(self):
-        if not self.queue:
-            return None
-        if not self.rate:
-            return 0
-        return self.queue[0][0]
-
-    def time_remaining(self):
-        """
-        Returns a timedelta representing how long until it makes sense to call tick() again.
-
-        If the queue is empty AND we're maxed out, this returns None.
-        """
-        if not self.queue and self.free >= self.burst:
-            return None
-        if not self.rate:
-            return self.ZEROTIME
-        return max(self.ZEROTIME, self.next - datetime.datetime.now() + (self.rate * ((self.next_cost() or 0) - 1)))
