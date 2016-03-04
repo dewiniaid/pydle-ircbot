@@ -226,6 +226,12 @@ class UsageError(Exception):
         self.param = param
 
 
+class PrecheckError(UsageError):
+    """Thrown when a binding's precheck function returns False."""
+    def __init__(self, message=None, arglist=None, param=None):
+        super().__init__(message or "This command is not available here.", arglist, param)
+
+
 class FinalUsageError(UsageError):
     """See UsageError"""
     pass
@@ -391,7 +397,7 @@ class Binding:
     FIRST_ARG = object()
     LAST_ARG = object()
 
-    def __init__(self, function, paramstring, summary=None, label=None):
+    def __init__(self, function, paramstring='', summary=None, label=None, precheck=None):
         """
         Creates a new :class:`CommandBinding`.
 
@@ -400,6 +406,8 @@ class Binding:
         :param label: Name of this binding.  Optional.
         :param summary: Optional short summary of usage.
         :param command: Command that we're attached to.
+        :param precheck: Optional function that takes a :class:`Invocation` and returns True if we should even be
+            considered for evaluation.
         """
         self.label = label
         self.function = function
@@ -407,6 +415,7 @@ class Binding:
         self.summary = summary
         self.binding_arg = None
         self.default_error = False
+        self.precheck = precheck or (lambda x: True)
 
         signature = self.signature
 
@@ -561,6 +570,9 @@ class Binding:
         :param kwargs: Initial keyword arguments to include in binding.
         :return: Outcome of signature.Bind()
         """
+        if not self.precheck(invocation):
+            raise PrecheckError()
+
         if self.binding_arg:
             if self.binding_arg == self.FIRST_ARG:
                 args = [self] + list(args)
@@ -1103,6 +1115,8 @@ class Command:
                 return binding(invocation, *args, **kwargs)
             except FinalUsageError:
                 raise
+            except PrecheckError:
+                pass
             except UsageError as ex:
                 if error is None or binding.default_error:
                     error = ex
@@ -1255,16 +1269,24 @@ def command(
 
 
 @chain_decorator
-def bind(fn, paramstring, summary=None, label=None):
+def bind(fn, paramstring='', summary=None, label=None, precheck=None, wrapper=None, function=None):
     """
     Adds a :class:`CommandBinding` to the pending command.  See that class for details on arguments.
     :param fn: Function to decorate, or a :class:`PendingCommand` instance.
     :param paramstring: Parameter string.
-    :param label: Optional label
     :param summary: Optional usage summary for help.
+    :param label: Optional label
+    :param precheck: Optional function that receives a :class:`Invocation` and returns True or False if the binding
+        should run.
+    :param wrapper: If not None, the called function will be wrapped by this one.
+    :param function: Overrides fn if present.  Convenience method for decorator chaining.
     :return:
     """
-    fn.bindings.append(Binding(fn.function, paramstring, summary, label))
+    function = function or fn.function
+    if wrapper:
+        function = wrapper(function)
+
+    fn.bindings.append(Binding(function, paramstring, summary, label, precheck=precheck))
 
 
 @chain_decorator
