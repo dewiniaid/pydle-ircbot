@@ -1,6 +1,14 @@
 """Miscellaneous utilities."""
 import collections
 import datetime
+import functools
+
+import tornado.locks
+import tornado.gen
+import pydle.async
+import tornado.concurrent
+import concurrent.futures
+import asyncio
 
 __all__ = ["listify"]
 
@@ -25,190 +33,212 @@ def listify(x):
 
 class Throttle:
     """
-    Implements a tunable throttling mechanism, e.g. for ensuring we don't flood IRC too much.
+    Implements an asynchronous event throttling mechanism, e.g. for ensuring we don't flood IRC too much.
 
-    This mechanism has two components: `burst`, which is the number of events we can trigger at once, and `rate`, which
-    is the amount of time required for to recover 1 event.
+    The throttling mechanism is essentially a bucket that holds `burst` units and is refilled by `amount` every `rate`
+    seconds.  The bucket can never exceed its capacity, but it can be 'less than empty' in some circumstances: At least
+    one event is guaranteed to execute when the bucket is full, even if the event's cost exceeds the total capacity.
 
-    :ivar burst: Configured maximum burst.
-    :ivar rate: Recovery rate as a timedelta
-    :ivar free: How many events are currently available for bursting
-    :ivar next: The next time a tick should occur.  This may be greater than `rate` seconds away
-    :ivar queue: Event queue.  Events are tuples of (cost, callable)
-    :ivar on_clear: Function called if the queue is emptied.
-    :ivar handle: Handle for scheduling.  Exact use is determined by caller.
+    The event queue is a `collections.deque` consisting of (cost, function) tuples.  Events are removed from the head
+    of the queue if there's at least `cost` units available in the bucket.
 
-    If rate is 0, has no actual throttling mechanics other than the fact that events are not executed until the queue
-    is ticked.
-
-    Scheduling with Throttle:
-    -------------------------
-
-    All of the methods that add item(s) to the queue (:meth:`add`, :meth:`addexec`, :meth:`extend`, :meth:`extendexec`)
-    as well as :meth:`tick` return either None or a timedelta.
-
-    If they return None, it is an indication that there is nothing to do and thus nothing should be scheduled.
-
-    If they return a timedelta (which may be a 0-second timedelta, particularly in the case of :meth:`add` and
-    :meth:`extend`), it means that :meth:`tick` should be called in that amount of time.
-
-    There is no harm in calling :meth:`tick` early, and doing so will have no effect.  (Its return value, however, will
-    tell you the next time you *should* call :meth:`tick`
-
-    There is also no harm in calling :meth:`tick` late (other than events being delayed in their triggering).  It will
-    correctly recover based on how much time has *actually* passed, and then process events until either the queue is
-    empty there are no remaining events.
-
-    Rate, Burst, and Event Cost:
-    ----------------------------
-
-    Throttle essentially works by having a bucket that holds `burst` units.  Every `rate` interval, one additional unit
-    is added to the bucket.  The bucket can never be overfilled; any excess is discarded just as it would be if pouring
-    water into a real bucket.  `free` indicates how full the bucket currently is (how many units are available for
-    execution); it will equal `burst` when the bucket is full.
-
-    Executing an event requires at least `cost` units in the bucket, which will be consumed when the event fires.
-
-    If an event's cost happens to be greater than the total size of the bucket (`burst`), it will execute the next time
-    the bucket is full.  In this case, the bucket can reach a less-than-empty state -- i.e. `free` will be negative.
-
-    The methods that return the amount of time until the next :meth:`tick` will take into account the cost of the next
-    event in the queue.  If the next event is cost 3 but only 1 unit is free, the time remaining will be 2*rate.  (This
-    isn't exactly true, since we might be halfway to the next recovery, but is close enough for explanation.)
+    :ivar burst: Maximum bucket capacity (must be > 0)
+    :ivar rate: Replenishment rate (must be >= 0, a replenishment rate of 0 disables all actual throttling mechanics.)
+    :ivar amount: How much is replenished. (must be > 0)
+    :ivar queue: Event queue.
+    :ivar _wake_condition: Internal condition for waking up the event loop.
     """
+    _FUTURE_CLASSES = (pydle.async.Future, tornado.concurrent.Future, asyncio.Future, concurrent.futures.Future)
     ZEROTIME = datetime.timedelta()
+    _now = datetime.datetime.now
+    _m = 0
 
-    def __init__(self, burst, rate, on_clear=None):
+    def __init__(self, burst, rate, amount=1, on_clear=None):
         """
         Creates a new Throttle.
 
-        :param burst: Maximum number of burstable events.  Should be at last 1
-        :param rate: Amount of time required before the number of available events recharges by 1, in seconds or as a
-            :class:`datetime.timedelta`.
-        :param on_clear: Function called when the queue is empty, or None
+        :param burst: The size of the 'bucket', or the maximum number of burstable events.  Must be > 0
+        :param rate: Amount of time required before the number of available events recharges, in seconds or as a
+            :class:`datetime.timedelta`.  Must be >= 0 seconds
+        :param amount: How many units are recharged every `rate`.  Must be > 0
+        :param on_clear: Function called when the queue is empty and the bucket is full, or None.  Receives the throttle
+            as an argument.
         """
-        self.burst = burst
         if not isinstance(rate, datetime.timedelta):
             rate = datetime.timedelta(seconds=rate)
         self.rate = rate
+        if self.rate < self.ZEROTIME:
+            raise ValueError('rate cannot be < 0 seconds')
+        if self.rate:
+            # Don't bother validating these if rate is zero, since they won't do anything.
+            if burst <= 0:
+                raise ValueError('burst must be > 0')
+            if amount <= 0:
+                raise ValueError('amount must be > 0')
+        self.burst = burst
         self.free = burst
-        self.last = datetime.datetime.now()
+        self.amount = amount
+        self.last = self._now()
         self.queue = collections.deque()
         self.on_clear = on_clear
-        self.handle = None
+        self._wake_condition = tornado.locks.Condition()
+        self._stop_condition = None
+        self.running = False
+        self._m = self.__class__._m
+        self.__class__._m += 1
+        self._n = 0
 
-    def add(self, item, tick=False):
+    def wake(self):
         """
-        Adds the callable to the queue, and immediately ticks the queue if `tick` is set.
+        Called when something is added to the queue in case we're waiting for something.
+        """
+        self._wake_condition.notify_all()
 
-        :param item: Callable to add, or a tuple of (cost, callable)
-        :param tick: If True, ticks the queue afterwards.
-        :returns: Time until next tick.
+    def _item(self, *args, **kwargs):
         """
-        if callable(item):
-            item = (1, item)
-        self.queue.append(item)
-        if tick:
-            self.tick()
-        return self.time_remaining()
+        Internal implementation for add() and extend()
+        """
+        if not callable(args[0]):
+            cost, *args = args
+        else:
+            cost = 1
+        item = (cost, functools.partial(*args, **kwargs))
+        return item
 
-    def addexec(self, item):
+    def add(self, *args, **kwargs):
         """
-        Adds the callable to the queue, and immediately ticks the queue if possible.
+        Adds an item to the event queue.
 
-        :param item: Callable to add, or a tuple of (cost, callable)
-        :returns: Time until next tick.
-        """
-        return self.add(item, tick=True)
+        Either the first or the second argument must be a callable.  If the first argument is a callable, the event
+        cost is considered to 1.  Otherwise, the first argument specifies the event cost and the second argument is
+        the callable.
 
-    def extend(self, items, tick=False):
+        Remaining args and kwargs will be bound to the callable.
         """
-        Adds the callables in items to the queue, and immediately ticks the queue if `tick` is set.
+        self.queue.append(self._item(*args, **kwargs))
+        self.wake()
 
-        :param items: Sequence of callables to add.  Each item may also be a a tuple of (cost, callable)
-        :param tick: If True, ticks the queue afterwards.
-        :returns: Time until next tick.
+    def extend(self, items):
         """
-        self.queue.extend((1, x) if callable(x) else x for x in items)
-        if tick:
-            self.tick()
-        return self.time_remaining()
+        Adds the collection of items to the queue.
 
-    def extendexec(self, items):
-        """
-        Adds the callables in items to the queue, and immediately ticks the queue.
+        Each item in the collection can be one of the following structures:
 
-        :param items: Sequence of callables to add.  Each item may also be a a tuple of (cost, callable)
-        :returns: Time until next tick.
+        - A callable, in which case this is equivalent to ``self.add(1, item)``
+        - A mapping (e.g. a dict), in which case this is equivalent to
+          ``args = item.pop(None); self.add(*item[None], **item``
+        - A sequence, in which case this is equivalent to ``self.add(*item)``
         """
-        return self.extend(items, tick=True)
+        def _gen():
+            for item in items:
+                if callable(item):
+                    yield self._item(1, item)
+                elif hasattr(item, 'keys'):
+                    item = dict(item)
+                    args = item.pop(None)
+                    yield self._item(*args, **item)
+                else:
+                    yield self._item(*item)
+        self.queue.extend(item for item in _gen())
+        self.wake()
 
-    def pop(self):
+    def is_future(self, value):
         """
-        Pops the oldest item off the queue and calls it.
+        Returns True if the value is something we consider a future.
+        """
+        return isinstance(value, self._FUTURE_CLASSES)
 
-        Returns False if the queue was empty.
+    def stop(self):
         """
-        if not self.queue:
+        Causes run() to stop the next time it gets a chance to do so.
+        """
+        self._stop_condition = tornado.locks.Condition()
+        self._wake_condition.notify_all()
+
+    @pydle.async.coroutine
+    def wait_for_stop(self):
+        self.stop()
+        yield self._stop_condition.wait()
+
+    @pydle.async.coroutine
+    def run(self):
+        """
+        Actually handles the throttling queue.
+        """
+        if self.running:
             return False
-        cost, fn = self.queue.popleft()
-        if not self.rate:
-            cost = 0
-        self.free -= cost
-        fn()
-        return True
+        try:
+            self.running = True
+            self._stop_condition = None
+            while not self._stop_condition:
+                self._n += 1
+                # Recover capacity
+                if self.rate and self.free < self.burst:
+                    # How much time has gone by?
+                    elapsed = self._now() - self.last
+                    ticks = elapsed / self.rate
+                    # Actually recover it.
+                    self.free = min(self.free + ticks*self.amount, self.burst)
+                    self.last += self.rate*ticks
 
-    def tick(self):
+                # Flush the queue.
+                while self.queue:
+                    cost = self.queue[0][0]
+                    if self.free >= self.burst:
+                        # Reset self.last to now so the timer is accurate.
+                        self.last = self._now()
+                    elif cost > self.free:
+                        # Can't handle this item yet.  How long would it take to fix that?
+                        deficit = min(cost, self.burst) - self.free
+                        ticks = deficit / self.amount
+                        timeout = (self.last + self.rate*ticks - self._now()).total_seconds()
+                        if timeout > 0:
+                            yield tornado.gen.sleep(timeout)
+                        break  # Restart the loop at capacity recovery.
+                    event = self.queue.popleft()[1]
+                    self.free -= cost
+                    result = event()
+                    if self.is_future(result):
+                        yield result
+                        if self._stop_condition:
+                            break
+
+                # Handle the potential lack of a queue.
+                if not self.queue:
+                    try:
+                        if not self.on_clear or self.free >= self.burst:
+                            # We don't care about when the queue is recharged, so sleep until we're awoken.
+                            if self.on_clear:
+                                self.on_clear(self)
+                            yield self._wake_condition.wait()
+                            continue
+                        # Figure out how long until we'll be full.  Sleep at most that long.
+                        ticks = ((self.burst - self.free) / self.amount)
+                        timeout = ((self.last - self._now()) + (self.rate * ticks))
+                        if timeout > self.ZEROTIME:
+                            result = self._wake_condition.wait(timeout=timeout)
+                            yield result
+                        continue
+                    except tornado.gen.TimeoutError:
+                        continue
+        except Exception as ex:
+            import traceback
+            traceback.print_exc()
+            raise ex
+        finally:
+            if self._stop_condition:
+                self._stop_condition.notify_all()
+            self.running = False
+
+    def clear(self):
         """
-        Ticks the queue.
+        Clears the current event queue.
         """
-        if not self.rate:
-            while self.queue:
-                self.pop()
-            return None
+        self.queue.clear()
 
-        # Recovery
-        self.recover()
-
-        while self.queue and (self.next_cost() <= self.free or self.free >= self.burst):
-            # As long as we have a queue and can either afford the next event or are full, run the next event
-            self.pop()
-
-        remaining = self.time_remaining()
-        if remaining is None and self.on_clear:
-            self.on_clear()
-        return remaining
-
-    def recover(self):
+    def reset(self):
         """
-        Refills the bucket based on elapsed time.  (Updates `free` and `next`)
+        Signals a stop and clears the event queue.
         """
-        elapsed = datetime.datetime.now() - self.last  # How much time since the last recovery?
-        ticks = elapsed // self.rate  # How many ticks is that?
-        if ticks <= 0:  # Zero?  Do nothing.
-            return
-        self.free = min(self.burst, self.free + ticks)
-        self.last += self.rate*ticks
-
-    def next_cost(self):
-        if not self.queue:
-            return None
-        if not self.rate:
-            return 0
-        return self.queue[0][0]
-
-    def time_remaining(self):
-        """
-        Returns a timedelta representing how long until it makes sense to call tick() again.
-
-        If the queue is empty, returns None.
-        """
-        cost = self.next_cost()
-        if cost is None:  # Only happens if the queue is empty.
-            return None  # No point in ticking, since there's no real work to do.
-        if not cost:  # Ludicrous speed.
-            return self.ZEROTIME  # Tick immediately.
-
-        # What time will be 'cost' ticks in the future?
-        target = self.last + self.rate*cost
-        return max(self.ZEROTIME, target - datetime.datetime.now())
+        self.stop()
+        self.clear()

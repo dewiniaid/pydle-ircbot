@@ -11,14 +11,14 @@ import functools
 import re
 import sys
 import textwrap
-import threading
 import traceback
-
+import fractions
 import pydle
 
 import ircbot.commands
 import ircbot.usertrack
 from ircbot.util import Throttle
+import tornado.locks
 
 
 class ConfigSection(dict):
@@ -82,18 +82,11 @@ class MainConfigSection(ConfigSection):
 
     # noinspection PyAttributeOutsideInit
     def read(self, section):
-        self.nicknames = re.split(r'[\s+,]', section.get('nick', '').strip())
+        self.nicknames = re.split(r'[\s,]+', section.get('nick', '').strip())
         self.verify_ssl = section.getboolean('verify_ssl', True)
         self.realname = section.get('realname', self.nicknames[0])
         self.username = section.get('username', self.nicknames[0])
         self.prefix = re.compile(section.get('prefix', '!'))
-
-        self.burst = section.getint('burst', 5)
-        self.rate = section.getfloat('rate', 0.5)
-        self.channel_burst = section.getint('channel_burst', 0)
-        self.channel_rate = section.getfloat('channel_rate', 0)
-        self.user_burst = section.getint('user_burst', 3)
-        self.user_rate = section.getfloat('user_rate', 1.0)
         self.wrap_length = section.getint('wrap_length', 400)
         self.wrap_indent = section.get('wrap_indent', '...')
 
@@ -126,6 +119,33 @@ class MainConfigSection(ConfigSection):
             self[attr] = section.get(attr)
 
 
+class ThrottleConfigSection(ConfigSection):
+    def read(self, section):
+        def parse_float(value, default=None):
+            if not value:
+                return default
+            return float(fractions.Fraction(value))
+
+        def parse_cost(value, default):
+            if not value:
+                return default
+            parts = dict(
+                zip(
+                    ('base', 'multiplier', 'exponent'),
+                    [parse_float(part) for part in re.split(r'[\s,]+', value)]
+                )
+            )
+            return parts.get('base', 1), parts.get('multiplier', 0), parts.get('exponent', 0)
+
+        self.burst = section.getint('burst', 5)
+        self.rate = section.getfloat('rate', 1.0)
+        self.channel_burst = section.getint('channel_burst', 0)
+        self.channel_rate = parse_float(section.get('channel_rate'), 0)
+        self.user_burst = section.getint('user_burst', 3)
+        self.user_rate = parse_float(section.get('user_rate'), 1.5)
+        self.cost_base, self.cost_multiplier, self.cost_exponent = parse_cost(section.get('cost'), (1.0, 0.0, 0.0))
+
+
 class Config:
     """
     Handles configuration, and is a wrapper around a :class:`configparser.ConfigParser`.
@@ -147,6 +167,7 @@ class Config:
             self.read_file(filename)
 
         self.section('main', MainConfigSection)
+        self.section('throttle', ThrottleConfigSection)
 
     def section(self, name, class_=None):
         """
@@ -299,7 +320,7 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         if config is None:
             config = Config(filename=filename, data=data)
         self.config = config
-        main = self.config['main']
+        main = self.config.main
 
         self.event_factory = kwargs.pop('event_factory', Event)
 
@@ -314,9 +335,9 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         self.command_registry = commands.Registry(prefix=main.prefix)
         super().__init__(**kwargs)
         self.events = collections.defaultdict(list)
-        self.global_throttle = Throttle(main.burst, main.rate)
+        self.global_throttle = Throttle(self.config.throttle.burst, self.config.throttle.rate)
         self.target_throttles = {}
-        self.throttle_lock = threading.RLock()
+        self.throttle_lock = tornado.locks.Lock()
         self.rules = []
 
         self.textwrapper = textwrap.TextWrapper(
@@ -362,6 +383,7 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
             if self.server_index >= len(self.config.main.servers):
                 self.server_index = 0
             kwargs.update(self.config.main.servers[self.server_index])
+        print("Connecting to {hostname}:{port}...".format(hostname=kwargs['hostname'], port=kwargs.get('port', 6667)))
         return super().connect(**kwargs)
 
     def on_connect(self):
@@ -369,11 +391,33 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         Attempt to join channels on connect.
         """
         super().on_connect()
+        print("Connected.")
         for channel in self.config.main.channels:
             try:
                 self.join(**channel)
             except pydle.AlreadyInChannel:
                 pass
+        self.eventloop.schedule(self.global_throttle.run)
+
+    def show_throttle_status(self):
+        try:
+            con = self.connection
+            print("throttle={con.throttle!r}, throttling={con.throttling!r}, handling={handling!r}, qout={qout}".format(
+                con=con, qout=len(con.send_queue),
+                handling=con.eventloop.handles_write(con.socket.fileno(), con._on_write),
+            ))
+        except Exception as ex:
+            import traceback
+            traceback.print_exc()
+
+    def on_disconnect(self, expected):
+        # Clean up pending triggers
+        while self.target_throttles:
+            target, throttle = self.target_throttles.popitem()
+            throttle.on_clear = None
+            print("Cleaning up event queue for {!r} ({} pending items)".format(target, len(throttle.queue)))
+            throttle.reset()
+        self.global_throttle.reset()
 
     def rule(self, pattern, fn=None):
         """
@@ -400,6 +444,7 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         kwargs.setdefault('registry', self.command_registry)
         return ircbot.commands.command(*args, **kwargs)
 
+    @pydle.coroutine
     def throttled(self, target, fn, cost=1):
         """
         Adds a throttled event.  Or calls it now if it makes sense to.
@@ -408,61 +453,66 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         :param fn: Function to queue or call
         :param cost: Event cost.
         """
-        # noinspection PyShadowingNames
-        def _tick_event(throttle, lock=None):
-            """Tick event helper"""
-            with lock if lock else contextlib.ExitStack():
-                throttle.handle = None
-                t = throttle.tick()
-                while t is not None and t < throttle.ZEROTIME:
-                    t = throttle.tick()
-                if t is not None:
-                    throttle.handle = self.eventloop.schedule_in(t, _tick_event, throttle, lock)
-
-        def _onclear(k):
-            """Callback for on_clear to free up dict space"""
-            if k in self.target_throttles:
+        def _on_clear(k, t):
+            t.reset()
+            if self.target_throttles.get(k) is t:
                 del self.target_throttles[k]
 
-        if target is None:
-            if not self.config.main.rate:
-                fn()
-                return
-            with self.throttle_lock:
-                self.global_throttle.add((cost, fn))
-                if self.global_throttle.handle is None:
-                    _tick_event(self.global_throttle, self.throttle_lock)
-            return
+        def _relay(*args, **kwargs):
+            self.global_throttle.add(*args, **kwargs)
+            return self.eventloop.schedule(self.global_throttle.run)
 
-        # If we're still here, we have a nick or a channel
-        fn = functools.partial(self.throttled, None, fn, cost)
-        with self.throttle_lock:
-            throttle = self.target_throttles.get(target)
-            if throttle is None:
-                is_channel = self.is_channel(target)
-                if is_channel:
-                    burst, rate = self.config.main.channel_burst, self.config.main.channel_rate
-                else:
-                    burst, rate = self.config.main.user_burst, self.config.main.user_rate
-                if not rate:
-                    fn()
-                    return
-                throttle = Throttle(burst, rate, on_clear=functools.partial(_onclear, target))
-            throttle.add(fn)
-            if throttle.handle is None:
-                _tick_event(throttle, self.throttle_lock)
+        if not target:
+            self.global_throttle.add(cost, target)
+            return self.eventloop.schedule(self.global_throttle.run)
+
+        throttle = self.target_throttles.get(target)
+        if not throttle:
+            is_channel = self.is_channel(target)
+            if is_channel:
+                burst, rate = self.config.throttle.channel_burst, self.config.throttle.channel_rate
+            else:
+                burst, rate = self.config.throttle.user_burst, self.config.throttle.user_rate
+            if not rate:
+                self.eventloop.schedule(fn)
+                return
+            throttle = Throttle(burst, rate, on_clear=functools.partial(_on_clear, target))
+            self.target_throttles[target] = throttle
+            self.eventloop.schedule(throttle.run)
+        throttle.add(cost, _relay, cost, fn)
+
+    def _unthrottled(self, fn):
+        @functools.wraps(fn)
+        def wrapper(*a, **kw):
+            throttled = self.connection.throttle
+            self.connection.throttle = False
+            fn(*a, **kw)
+            self.connection.throttle = throttled
+        return wrapper
 
     def _msgwrapper(self, parent, target, message, wrap=True, throttle=True, cost=1):
         if wrap:
             message = "\n".join(self.wraptext(message))
+
         for line in message.replace('\r', '').split('\n'):
             if throttle:
-                self.throttled(target, functools.partial(parent, target, line), cost)
+                return self.throttled(target, functools.partial(self._unthrottled(parent), target, line), cost)
             else:
-                target(parent, target, line)
+                return target(parent, target, line)
+
+    def message_cost(self, length):
+        """
+        Returns the cost of a message of size length.
+        :param length: Length of message
+        :return: Message cost
+        """
+        return self.config.throttle.cost_base + (
+            float(length) * self.config.throttle.cost_multiplier *
+            (float(length) ** self.config.throttle.cost_exponent)
+        )
 
     # Override the builtin message() and notice() methods to allow for throttling and our own wordwrap methods.
-    def message(self, target, message, wrap=True, throttle=True, cost=1):
+    def message(self, target, message, wrap=True, throttle=True, cost=None):
         """
         Sends a PRIVMSG
 
@@ -472,9 +522,11 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         :param throttle: If True, messaging will be throttled.
         :param cost: If throttled, the cost per message.
         """
+        if cost is None:
+            cost = self.message_cost(len(target) + len(message) + 10)
         self._msgwrapper(super().message, target, message, wrap, throttle, cost)
 
-    def notice(self, target, message, wrap=True, throttle=True, cost=1):
+    def notice(self, target, message, wrap=True, throttle=True, cost=None):
         """
         Sends a NOTICE
 
@@ -484,6 +536,8 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         :param throttle: If True, messaging will be throttled.
         :param cost: If throttled, the cost per message.
         """
+        if cost is None:
+            cost = self.message_cost(len(target) + len(message) + 10)
         self._msgwrapper(super().notice, target, message, wrap, throttle, cost)
 
     # Convenience functions for bot events
@@ -640,7 +694,6 @@ class Event(ircbot.commands.Invocation):
     def unotice(self, *args, **kwargs):
         """bot.notice, but messaging the sender (not the channel) by default"""
         return self.bot.notice(*args, **kwargs)
-
 
     @_implied_target
     def action(self, *args, **kwargs):
