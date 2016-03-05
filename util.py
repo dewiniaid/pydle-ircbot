@@ -92,7 +92,7 @@ class Throttle:
             rate = datetime.timedelta(seconds=rate)
         self.rate = rate
         self.free = burst
-        self.next = datetime.datetime.now() + rate
+        self.last = datetime.datetime.now()
         self.queue = collections.deque()
         self.on_clear = on_clear
         self.handle = None
@@ -103,7 +103,7 @@ class Throttle:
 
         :param item: Callable to add, or a tuple of (cost, callable)
         :param tick: If True, ticks the queue afterwards.
-        :returns: (possibly updated) self.next
+        :returns: Time until next tick.
         """
         if callable(item):
             item = (1, item)
@@ -117,6 +117,7 @@ class Throttle:
         Adds the callable to the queue, and immediately ticks the queue if possible.
 
         :param item: Callable to add, or a tuple of (cost, callable)
+        :returns: Time until next tick.
         """
         return self.add(item, tick=True)
 
@@ -126,6 +127,7 @@ class Throttle:
 
         :param items: Sequence of callables to add.  Each item may also be a a tuple of (cost, callable)
         :param tick: If True, ticks the queue afterwards.
+        :returns: Time until next tick.
         """
         self.queue.extend((1, x) if callable(x) else x for x in items)
         if tick:
@@ -137,6 +139,7 @@ class Throttle:
         Adds the callables in items to the queue, and immediately ticks the queue.
 
         :param items: Sequence of callables to add.  Each item may also be a a tuple of (cost, callable)
+        :returns: Time until next tick.
         """
         return self.extend(items, tick=True)
 
@@ -164,16 +167,13 @@ class Throttle:
                 self.pop()
             return None
 
-        if self.free >= self.burst:
-            # If we're at max, run the next command regardless of its cost.
-            if self.queue:
-                self.pop()
-                self.next = datetime.datetime.now() + self.rate
-        else:
-            self.recover()
+        # Recovery
+        self.recover()
 
-        while self.queue and self.next_cost() <= self.free:
+        while self.queue and (self.next_cost() <= self.free or self.free >= self.burst):
+            # As long as we have a queue and can either afford the next event or are full, run the next event
             self.pop()
+
         remaining = self.time_remaining()
         if remaining is None and self.on_clear:
             self.on_clear()
@@ -183,11 +183,12 @@ class Throttle:
         """
         Refills the bucket based on elapsed time.  (Updates `free` and `next`)
         """
-        recovered = min((datetime.datetime.now() - self.next) // self.rate, self.burst - self.free)
-        if recovered <= 0:
+        elapsed = datetime.datetime.now() - self.last  # How much time since the last recovery?
+        ticks = elapsed // self.rate  # How many ticks is that?
+        if ticks <= 0:  # Zero?  Do nothing.
             return
-        self.next += self.rate*recovered  # We'll get 1 tick by then.
-        self.free += recovered
+        self.free = min(self.burst, self.free + ticks)
+        self.last += self.rate*ticks
 
     def next_cost(self):
         if not self.queue:
@@ -200,13 +201,14 @@ class Throttle:
         """
         Returns a timedelta representing how long until it makes sense to call tick() again.
 
-        If the queue is empty AND we're maxed out, this returns None.
+        If the queue is empty, returns None.
         """
-        if not self.queue and self.free >= self.burst:
-            return None
-        if not self.rate:
-            return self.ZEROTIME
-        return max(
-            self.ZEROTIME,
-            self.next - datetime.datetime.now() + (self.rate * (min(self.next_cost() or 0, self.burst) - 1))
-        )
+        cost = self.next_cost()
+        if cost is None:  # Only happens if the queue is empty.
+            return None  # No point in ticking, since there's no real work to do.
+        if not cost:  # Ludicrous speed.
+            return self.ZEROTIME  # Tick immediately.
+
+        # What time will be 'cost' ticks in the future?
+        target = self.last + self.rate*cost
+        return max(self.ZEROTIME, target - datetime.datetime.now())
