@@ -1,5 +1,6 @@
 """Miscellaneous utilities."""
 import collections
+import collections.abc
 import datetime
 import functools
 
@@ -242,3 +243,167 @@ class Throttle:
         """
         self.stop()
         self.clear()
+
+
+class DependencyOrderingSet(collections.abc.MutableSet):
+    """
+    Handles ordering items, where each item may optionally specify some other items it must be before and must be after.
+
+    Items added to the list are internally stored in dicts and sets and thus must be hashable.
+    """
+    _ItemClass = collections.namedtuple('_ItemClass', ['before', 'after'])
+
+    @classmethod
+    def _itemfactory(cls):
+        return cls._ItemClass(before=set(), after=set())
+
+    def __init__(self, strict=True):
+        """
+        Creates a new DependencyOrderingList.
+
+        :param strict: If True, items defined as before/after must exist when resolving dependencies.  If False, they
+            treated as automatically resolved.
+        """
+        self.strict = strict
+        self._data = collections.defaultdict(self._itemfactory)
+        self._solution = None
+
+    def add(self, item, before=None, after=None):
+        """
+        Adds an item to the set.
+
+        :param item: Item to add.  Must be hashable; cannot already exist.
+        :param before: Sequence of items that this must be before, or None.
+        :param after: Sequence of items that this must be after, or None.
+
+        If the item already exists in the set, before and after are merged with the existing contents.
+        If the set was already solved, renders it unsolved.
+        """
+        self._solution = None
+        self._data[item].before.update(before or [])
+        self._data[item].after.update(after or [])
+
+    def before(self, item, *before):
+        """
+        Updates item to be before items in before.  Item must already exist.
+        """
+        if item not in self._data:
+            raise KeyError(item)
+        self._solution = None
+        self._data.before.update(before)
+
+    def after(self, item, *before):
+        """
+        Updates item to be after items in after.  Item must already exist.
+        """
+        if item not in self._data:
+            raise KeyError(item)
+        self._solution = None
+        self._data.after.update(after)
+
+    def not_before(self, item, *before):
+        """
+        Updates item to not be before items in before.  Item must already exist.
+        """
+        if item not in self._data:
+            raise KeyError(item)
+        self._solution = None
+        self._data.before -= set(before)
+
+    def not_after(self, item, *after):
+        """
+        Updates item to not be after items in after.  Item must already exist.
+        """
+        if item not in self._data:
+            raise KeyError(item)
+        self._solution = None
+        self._data.after -= set(after)
+
+    def solve(self):
+        pending = dict((k, set(v.after)) for k, v in self._data.items())
+        for k, v in pending.items():
+            if not v:
+                continue
+            if k in v:
+                raise RuntimeError("Item {!r} is dependant on itself.".format(k))
+            missing = list(filter(lambda x: x not in pending, v))
+            if missing and self.strict:
+                raise RuntimeError("Item {!r} is missing dependency {!r}".format(k, missing[0]))
+            v.difference_update(missing)
+        for k, v in self._data.items():
+            for item in v.before:
+                if item in pending:
+                    pending[item].add(k)
+                elif self.strict:
+                    raise RuntimeError("Item {!r} is missing dependency {!r}".format(k, item))
+        solution = []
+        n = 0
+        while pending:
+            n += 1
+            # Find items with no (remaining) dependencies.
+            solved = list(k for k, v in pending.items() if not v)
+            if not solved:
+                raise RuntimeError(
+                    "Could not solve dependencies on pass {} ({} items remaining)".format(n, len(pending))
+                )
+            solution.extend(solved)
+            for item in solved:
+                del pending[item]
+            for v in pending.values():
+                v.difference_update(solved)
+        self._solution = solution
+
+    def discard(self, item):
+        """
+        Removes an item from a set.
+
+        :param item:
+        """
+        try:
+            del self._data[item]
+            self._solution = None
+        except KeyError:
+            pass
+
+    def remove(self, value):
+        del self._data[item]  # Propogate the KeyError, if there is one
+        self._solution = None
+
+    def clear(self):
+        self._solution = None
+        self._data = collections.defaultdict(self._itemfactory)
+
+    def __contains__(self, x):
+        return x in self._data
+
+    def unsorted(self):
+        return iter(self._solution)
+
+    def __iter__(self):
+        if self._solution is None:
+            self.solve()
+        return iter(self._solution)
+
+    def __len__(self):
+        return len(self._data)
+
+
+if __name__ == '__main__':
+    dset = DependencyOrderingSet()
+
+    ct = 10000
+    import random
+    for ix in range(ct):
+        obj = ix
+        before = set()
+        after = set()
+        pending = set()
+
+        # Decide what our odds of having 'before' items are.
+        p = ix/(ct-1)
+        if random.random() > (0.85 * p):
+            after = set(random.sample(range(0, ix), random.randrange(1 + int(0.10*ix))))
+        if random.random() > (0.65 * (1-p)):
+            before = set(random.sample(range(ix+1, ct), random.randrange(1 + int(0.10*(ct - ix - 1)))))
+        dset.add(obj, before, after)
+    print(", ".join(str(x) for x in dset))
