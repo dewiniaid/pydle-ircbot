@@ -10,6 +10,7 @@ import pydle.async
 import tornado.concurrent
 import concurrent.futures
 import asyncio
+import operator
 
 __all__ = ["listify"]
 
@@ -245,97 +246,163 @@ class Throttle:
         self.clear()
 
 
-class DependencyOrderingSet(collections.abc.MutableSet):
+class DependencyItem(collections.namedtuple('_DependencyItem', ['before', 'after', 'requires', 'required_by', 'data'])):
+    def __new__(cls, before=None, after=None, required_by=None, requires=None, data=None):
+        """
+        Creates a new :class:`DependencyItem`
+
+        :param before: This item will be before these items (if they exist)
+        :param after: This item will be after these items (if they exist)
+        :param required_by: Same as `before`, but the items must exist.
+        :param requires: Same as `after`, but the items must exist.
+        :param data: Optional data to associate.
+        :return: A new :class:`DependencyItem`
+
+        All dependencies are stored in sets and thus must be hashable.
+
+        Items in `before` and `required_by` should not be in `after` or `requires`.  Dependency sorting will fail
+        if they are.
+        """
+        before = set(before) if before else set()
+        after = set(after) if after else set()
+        required_by = set(required_by) if required_by else set()
+        requires = set(required_by) if required_by else set()
+        return super().__new__(cls, before, after, required_by, requires, data)
+
+
+class DependencyDict(collections.abc.MutableMapping):
     """
-    Handles ordering items, where each item may optionally specify some other items it must be before and must be after.
+    Handles a set of items with internal dependencies and sorts them in dependency order.
 
-    Items added to the list are internally stored in dicts and sets and thus must be hashable.
+    A DependencyDict is a mapping of ```{ key: :class:`DependencyItem` } items.  The :attr:`~DependencyItem.before`,
+    :attr:`~DependencyItem.after`, :attr:`~DependencyItem.requires` and :attr:`~DependencyItem.required_by` attributes
+    on each item refer to other keys in the DependencyDict and how the item relates to them.
+
+    Dependency solving will fail if there is a circular relationship between items, or if an item requires or is
+    required by another item that is not present in a list.
+
+    Items can be added to a DependencyDict using its :meth:`add` method, which will automatically construct the
+    appropriate DependencyItem.  They can also be added using normal dictionary methods, provided that they are
+    one of:
+
+    - a :class:`DependencyItem`
+    - `None` or another false-y value, which turns into an empty `DependencyItem`
+    - Something dictionary-like, which is passed as keyword arguments to `add` and thus to `DependencyItem`
+    - Something sequence-like, which is passed as positional arguments to `add` and thus to `DependencyItem`
     """
-    _ItemClass = collections.namedtuple('_ItemClass', ['before', 'after'])
+    #: Class or factory that produces dependency items.
+    ITEMCLASS = DependencyItem
 
-    @classmethod
-    def _itemfactory(cls):
-        return cls._ItemClass(before=set(), after=set())
+    #: Used in validating items and producing error messages.  (attr, verb, required, before)
+    _ITEM_ATTRINFO = (
+        ('before', 'is before', False, True), ('required_by', 'is required by', True, True),
+        ('after', 'is after', False, False), ('requires', 'requires', True, False)
+    )
 
-    def __init__(self, strict=True):
+    __marker = object()
+    def __init__(self, *items):
         """
-        Creates a new DependencyOrderingList.
-
-        :param strict: If True, items defined as before/after must exist when resolving dependencies.  If False, they
-            treated as automatically resolved.
+        Creates a new :class:`DependencyDict`.
         """
-        self.strict = strict
-        self._data = collections.defaultdict(self._itemfactory)
-        self._solution = None
+        self._data = {}
+        self._solution = {}
+        self._passes = None  # How many passes solving took.
 
-    def add(self, item, before=None, after=None):
+    def add(self, key, *args, **kwargs):
         """
-        Adds an item to the set.
+        Adds an item to the dictionary, creating a DependencyItem based on parameters.
 
-        :param item: Item to add.  Must be hashable; cannot already exist.
-        :param before: Sequence of items that this must be before, or None.
-        :param after: Sequence of items that this must be after, or None.
+        Equivalent to self[key] = DependencyItem(*args, **kwargs)
+
+        :param key: Dictionary key.
+        :param args: Passed to DependencyItem constructor.
+        :param kwargs: Passed to DependencyItem constructor.
 
         If the item already exists in the set, before and after are merged with the existing contents.
         If the set was already solved, renders it unsolved.
-        """
-        self._solution = None
-        self._data[item].before.update(before or [])
-        self._data[item].after.update(after or [])
 
-    def before(self, item, *before):
+        Passing nothing but `key` is perfectly valid and creates an item with no explicit dependencies.
         """
-        Updates item to be before items in before.  Item must already exist.
-        """
-        if item not in self._data:
-            raise KeyError(item)
         self._solution = None
-        self._data.before.update(before)
+        self._data[key] = self.ITEMCLASS(*args, **kwargs)
 
-    def after(self, item, *before):
-        """
-        Updates item to be after items in after.  Item must already exist.
-        """
-        if item not in self._data:
-            raise KeyError(item)
-        self._solution = None
-        self._data.after.update(after)
+    def clear(self):
+        self._solution = {}
+        self._data = {}
 
-    def not_before(self, item, *before):
-        """
-        Updates item to not be before items in before.  Item must already exist.
-        """
-        if item not in self._data:
-            raise KeyError(item)
+    def pop(self, key, default=__marker):
+        if default is self.__marker:
+            result = super().pop(key)
+        else:
+            result = super().pop(key, default)
         self._solution = None
-        self._data.before -= set(before)
+        return result
 
-    def not_after(self, item, *after):
-        """
-        Updates item to not be after items in after.  Item must already exist.
-        """
-        if item not in self._data:
-            raise KeyError(item)
+    def popitem(self):
+        result = super().popitem()
         self._solution = None
-        self._data.after -= set(after)
+        return result
+
+    def __setitem__(self, key, value):
+        if isinstance(value, self.ITEMCLASS):
+            self._data[key] = value
+            self._solution = None
+            return
+        if not value:
+            value = tuple()
+        elif hasattr(value, 'keys') and hasattr(value, '__getitem__'):
+            return self.add(key, **value)
+        return self.add(key, *value)
+
+    def __delitem__(self, key):
+        del self._data[key]
+        self._solution = None
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def unsorted_keys(self):
+        """Returns dictionary keys in an undetermined order.  Will not solve dependencies."""
+        return self._data.keys()
+
+    def unsorted_values(self):
+        """Returns dictionary values in an undetermined order.  Will not solve dependencies."""
+        return self._data.values()
+
+    def unsorted_items(self):
+        """Returns dictionary items in an undetermined order.  Will not solve dependencies."""
+        return self._data.items()
 
     def solve(self):
-        pending = dict((k, set(v.after)) for k, v in self._data.items())
-        for k, v in pending.items():
-            if not v:
-                continue
-            if k in v:
-                raise RuntimeError("Item {!r} is dependant on itself.".format(k))
-            missing = list(filter(lambda x: x not in pending, v))
-            if missing and self.strict:
-                raise RuntimeError("Item {!r} is missing dependency {!r}".format(k, missing[0]))
-            v.difference_update(missing)
+        """Solves dependencies and performs a topological sort."""
+        pending = {k: set() for k in self._data}
+        keys = pending.keys()
+
+        # Validate everything and set up pending.
         for k, v in self._data.items():
-            for item in v.before:
-                if item in pending:
-                    pending[item].add(k)
-                elif self.strict:
-                    raise RuntimeError("Item {!r} is missing dependency {!r}".format(k, item))
+            for attr, verb, required, before in self._ITEM_ATTRINFO:
+                items = getattr(v, attr)
+                if k in items:
+                    raise RuntimeError("Item {!r} {} itself.".format(k, verb), k, attr)
+                if required:
+                    missing = items - keys
+                    if missing:
+                        missing = missing.pop()
+                        raise RuntimeError("Item {!r} {} missing item {!r}.".format(k, verb, missing), k, attr, missing)
+                    overlap = items
+                else:
+                    overlap = items & keys
+
+                if before:
+                    for other in overlap:
+                        pending[other].add(k)
+                    continue
+                pending[k].update(overlap)
+
+        # Actually solve.
         solution = []
         n = 0
         while pending:
@@ -344,7 +411,8 @@ class DependencyOrderingSet(collections.abc.MutableSet):
             solved = list(k for k, v in pending.items() if not v)
             if not solved:
                 raise RuntimeError(
-                    "Could not solve dependencies on pass {} ({} items remaining)".format(n, len(pending))
+                    "Could not solve dependencies on pass {} ({} items remaining)".format(n, len(pending)),
+                    n, len(pending)
                 )
             solution.extend(solved)
             for item in solved:
@@ -352,32 +420,7 @@ class DependencyOrderingSet(collections.abc.MutableSet):
             for v in pending.values():
                 v.difference_update(solved)
         self._solution = solution
-
-    def discard(self, item):
-        """
-        Removes an item from a set.
-
-        :param item:
-        """
-        try:
-            del self._data[item]
-            self._solution = None
-        except KeyError:
-            pass
-
-    def remove(self, value):
-        del self._data[item]  # Propogate the KeyError, if there is one
-        self._solution = None
-
-    def clear(self):
-        self._solution = None
-        self._data = collections.defaultdict(self._itemfactory)
-
-    def __contains__(self, x):
-        return x in self._data
-
-    def unsorted(self):
-        return iter(self._solution)
+        self._passes = n
 
     def __iter__(self):
         if self._solution is None:
@@ -389,9 +432,9 @@ class DependencyOrderingSet(collections.abc.MutableSet):
 
 
 if __name__ == '__main__':
-    dset = DependencyOrderingSet()
+    dset = DependencyDict()
 
-    ct = 10000
+    ct = 1000
     import random
     for ix in range(ct):
         obj = ix
@@ -407,3 +450,4 @@ if __name__ == '__main__':
             before = set(random.sample(range(ix+1, ct), random.randrange(1 + int(0.10*(ct - ix - 1)))))
         dset.add(obj, before, after)
     print(", ".join(str(x) for x in dset))
+    print(", ".join(str(x) for x in dset._solution))
