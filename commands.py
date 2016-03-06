@@ -52,7 +52,7 @@ from ircbot.util import listify
 
 __all__ = [
     'Argument', 'ArgumentList',
-    'Binding', 'ParamType', 'ConstParamType', 'StrParamType', 'NumberParamType',
+    'Binding', 'register_type', 'ParamType', 'ConstParamType', 'StrParamType', 'NumberParamType',
     'UsageError', 'FinalUsageError', 'ParseError',
     'Command', 'PendingCommand', 'wrap_decorator', 'chain_decorator', 'command', 'alias', 'bind', 'match', 'doc'
 ]
@@ -627,6 +627,9 @@ class Binding:
         bound = self.bind(invocation, *args, **kwargs)
         invocation.binding = self
         return self.function(*bound.args, **bound.kwargs)
+
+
+register_type = Binding.register_type
 
 
 class Parameter:
