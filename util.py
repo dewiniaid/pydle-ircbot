@@ -300,12 +300,15 @@ class DependencyDict(collections.abc.MutableMapping):
     )
 
     __marker = object()
-    def __init__(self, *items):
+    def __init__(self, key=False):
         """
         Creates a new :class:`DependencyDict`.
+        :param key: If `False`, no sorting is performed other than what dependency solving required.  Otherwise, passed
+        as-is to functions that perform sorting.
         """
-        self._data = {}
-        self._solution = {}
+        self.sortkey = key
+        self._data = collections.OrderedDict()
+        self._solved = False  # True if we've performed sorting and whatnot.
         self._passes = None  # How many passes solving took.
 
     def add(self, key, *args, **kwargs):
@@ -323,30 +326,30 @@ class DependencyDict(collections.abc.MutableMapping):
 
         Passing nothing but `key` is perfectly valid and creates an item with no explicit dependencies.
         """
-        self._solution = None
         self._data[key] = self.ITEMCLASS(*args, **kwargs)
+        self._solved = False
 
     def clear(self):
-        self._solution = {}
         self._data = {}
+        self._solved = True  # Because there's zero elements!
 
     def pop(self, key, default=__marker):
         if default is self.__marker:
             result = super().pop(key)
         else:
             result = super().pop(key, default)
-        self._solution = None
+        self._solved = not len(self._data)
         return result
 
     def popitem(self):
         result = super().popitem()
-        self._solution = None
+        self._solved = not len(self._data)
         return result
 
     def __setitem__(self, key, value):
         if isinstance(value, self.ITEMCLASS):
             self._data[key] = value
-            self._solution = None
+            self._solved = False
             return
         if not value:
             value = tuple()
@@ -356,7 +359,7 @@ class DependencyDict(collections.abc.MutableMapping):
 
     def __delitem__(self, key):
         del self._data[key]
-        self._solution = None
+        self._solved = not len(self._data)
 
     def __getitem__(self, key):
         return self._data[key]
@@ -378,7 +381,7 @@ class DependencyDict(collections.abc.MutableMapping):
 
     def solve(self):
         """Solves dependencies and performs a topological sort."""
-        pending = {k: set() for k in self._data}
+        pending = collections.OrderedDict((k, set()) for k in self._data)
         keys = pending.keys()
 
         # Validate everything and set up pending.
@@ -408,7 +411,10 @@ class DependencyDict(collections.abc.MutableMapping):
         while pending:
             n += 1
             # Find items with no (remaining) dependencies.
-            solved = list(k for k, v in pending.items() if not v)
+            if self.sortkey is False:
+                solved = list(k for k, v in pending.items() if not v)
+            else:
+                solved = list(item[0] for item in sorted(filter(lambda x: not x[1], pending.items()), key=self.sortkey))
             if not solved:
                 raise RuntimeError(
                     "Could not solve dependencies on pass {} ({} items remaining)".format(n, len(pending)),
@@ -419,20 +425,36 @@ class DependencyDict(collections.abc.MutableMapping):
                 del pending[item]
             for v in pending.values():
                 v.difference_update(solved)
-        self._solution = solution
+        self._data = collections.OrderedDict((k, self._data[k]) for k in solution)
+        self._solved = True
         self._passes = n
 
     def __iter__(self):
-        if self._solution is None:
+        if not self._solved:
             self.solve()
-        return iter(self._solution)
+        return iter(self._data)
+
+    def keys(self):
+        if not self._solved:
+            self.solve()
+        return self._data.keys()
+
+    def items(self):
+        if not self._solved:
+            self.solve()
+        return self._data.items()
+
+    def values(self):
+        if not self._solved:
+            self.solve()
+        return self._data.values()
 
     def __len__(self):
         return len(self._data)
 
 
 if __name__ == '__main__':
-    dset = DependencyDict()
+    dset = DependencyDict(key=lambda x: -x[0])
 
     ct = 1000
     import random
@@ -450,4 +472,3 @@ if __name__ == '__main__':
             before = set(random.sample(range(ix+1, ct), random.randrange(1 + int(0.10*(ct - ix - 1)))))
         dset.add(obj, before, after)
     print(", ".join(str(x) for x in dset))
-    print(", ".join(str(x) for x in dset._solution))
