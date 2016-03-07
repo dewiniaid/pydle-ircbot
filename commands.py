@@ -48,7 +48,7 @@ import collections
 import functools
 import itertools
 
-from ircbot.util import listify
+import ircbot.util
 
 __all__ = [
     'Argument', 'ArgumentList',
@@ -424,7 +424,7 @@ class Binding:
         :param label: Name of this binding.  Optional.
         :param summary: Optional short summary of usage.
         :param command: Command that we're attached to.
-        :param precheck: Optional function that takes a :class:`Invocation` and returns True if we should even be
+        :param precheck: Optional function that takes a :class:`Event` and returns True if we should even be
             considered for evaluation.
         """
         self.label = label
@@ -580,15 +580,15 @@ class Binding:
 
         return decorator if class_ is None else decorator(class_)
 
-    def bind(self, invocation, *args, **kwargs):
+    def bind(self, event, *args, **kwargs):
         """
         Binds the information in input_string
-        :param invocation: An :class:`Invocation`
+        :param event: An :class:`Event`
         :param args: Initial arguments to include in binding.
         :param kwargs: Initial keyword arguments to include in binding.
         :return: Outcome of signature.Bind()
         """
-        if not self.precheck(invocation):
+        if not self.precheck(event):
             raise PrecheckError()
 
         if self.binding_arg:
@@ -599,21 +599,21 @@ class Binding:
             else:
                 kwargs[self.binding_arg] = self
         if (
-                        len(invocation.arglist) > len(self.params) and
+                        len(event.arglist) > len(self.params) and
                     (not self.params or not (self.params[-1].eol or self.params[-1].listmode))
         ):
             raise UsageError("Incorrect number of arguments.")
 
         for param in self.params:
-            param.validate(invocation.arglist)
+            param.validate(event.arglist)
 
         for param in self.params:
-            param.bind(invocation.arglist, args, kwargs)
+            param.bind(event.arglist, args, kwargs)
             # Did we get too many arguments?
 
-        return self.signature.bind(invocation, *args, **kwargs)
+        return self.signature.bind(event, *args, **kwargs)
 
-    def __call__(self, invocation, *args, **kwargs):
+    def __call__(self, event, *args, **kwargs):
         """
         Calls the bound function.
 
@@ -624,8 +624,8 @@ class Binding:
         :param kwargs: Initial keyword arguments to include in binding.
         :return: Result of function call.
         """
-        bound = self.bind(invocation, *args, **kwargs)
-        invocation.binding = self
+        bound = self.bind(event, *args, **kwargs)
+        event.binding = self
         return self.function(*bound.args, **bound.kwargs)
 
 
@@ -641,7 +641,7 @@ class Parameter:
         """
         Defines a new parameter
 
-        :param parent: Parent :class:`CommandBinding`.
+        :param parent: Parent :class:`Binding`.
         :param index: Index in list
         :param arg: Function argument name.  May be None in some circumstances.
         :param type_: Parameter type
@@ -896,11 +896,11 @@ class NumberParamType(ParamType):
 
 
 # noinspection PyShadowingNames
-class Invocation:
+class Event:
     """Stores the result from :meth:`Registry.parse`, and includes data passed to commands and bindings."""
     def __init__(self, prefix=None, name=None, command=None, text=None):
         """
-        Creates a new :class:`Invocation`
+        Creates a new :class:`Event`
 
         :param prefix: Prefix that matched.  Will be None if there was no match.
         :param name: Name of command as entered (minus prefix).  May differ from command.name
@@ -941,18 +941,6 @@ class Invocation:
             self._arglist = ArgumentList(self.text)
         return self._arglist
 
-    def __call__(self, *args, **kwargs):
-        """
-        Calls self.command.
-
-        :param args: Initial arguments (prior to binding)
-        :param kwargs: Initial kwargs (prior to binding)
-        :return: self.command's return value.
-        """
-        if not self:
-            raise ValueError("No command bound.")
-        return self.command(self, *args, **kwargs)
-
 
 # noinspection PyShadowingNames
 class Registry:
@@ -961,19 +949,39 @@ class Registry:
 
     :ivar aliases: Dictionary of alias -> command.
     :ivar patterns: Dictionary of patterns -> commands
-    :ivar prefix: Regular expression that matches the beginning of a command.
-    :ivar separator: Pattern that separates a command from its arguments.
+    :ivar regex: Pattern that matches commands.  Should have named groups 'prefix', 'name', and 'text'
     """
 
-    def __init__(self, prefix, separator=re.compile(r'\s+')):
+    #: Default pattern for regex matching.  %% will be replaced by the prefix regex.
+    DEFAULT_PATTERN = '(?P<prefix>!)(?P<name>\S+)(?:\s+?(?P<text>\S+)\s*)?'
+
+    def __init__(self, prefix=None, pattern=None):
         """
-        :param prefix: Regular expression that matches the beginning of a command.
+        :param prefix: Partial regular expression that matches the beginning of a command.  Will be compiled into a
+            more complete regular expression.  Optional if 'match' is not specified.
+        :param pattern: Regular expression that matches a line of text and breaks it into named groups "prefix", "name",
+        and "text".  (At least "name" and "text" must be present.)
         :param separator: Regular expression that separates the command from its argument list.
         """
-        self.prefix = prefix
+        if pattern is None:
+            if prefix is None:
+                prefix = '!'
+            if hasattr(prefix, 'pattern'):  # Already a compiled regex
+                prefix = prefix.pattern
+            pattern = self.DEFAULT_PATTERN.replace("%%", prefix)
+        if not hasattr(pattern, 'pattern'):
+            pattern = re.compile(pattern)
+
+        # Make sure pattern is sane.
+        t = pattern.groupindex
+        if 'name' not in t:
+            raise TypeError("pattern must have a group named 'name'")
+        if 'text' not in t:
+            raise TypeError("pattern must have a group named 'text'")
+        self.has_prefix = 'prefix' in t
+        self.regex = pattern
         self.aliases = {}
         self.patterns = {}
-        self.separator = separator
 
     def register(self, *commands):
         """
@@ -1013,24 +1021,47 @@ class Registry:
         """
         return next(self.lookup_all(search), None)
 
-    def parse(self, text, factory=Invocation):
-        """
-        Parses a line of text and returns a :class:`Invocation` representing the outcome of the parse.
+    def split_command(self, text):
+        return ircbot.util.pad(self.separator.split(text, 1), 2, '')
 
-        If no command is found, `Invocation.command` will be None.
+    def match(self, text):
+        result = self.regex.fullmatch(text)
+        if not result:
+            return False
+        return result.group('prefix') if self.has_prefix else None, result.group('name'), result.group('text')
+
+    def update_event(self, match, event):
+        """
+        Updates an event based on our match result.
+
+        :param match: Match result
+        :param event: Event to update.
+        """
+        prefix, name, text = match
+        command = self.lookup(name)
+        event.prefix = prefix
+        event.name = name
+        event.command = command
+        event.text = text or ''
+
+    def parse(self, text, factory=Event, event=None):
+        """
+        Parses a line of text and returns a :class:`Event` representing the outcome of the parse.
+
+        If no command is found, `Event.command` will be None.
 
         :param text: Text to parse
-        :param factory: Factory class to use instead of Invocation.  Must accept prefix, name, command and text kwargs.
-        :returns: :class:`Invocation` or factory class.
+        :param factory: Factory class to use instead of Event.  Return object must have prefix, name, command and text
+            attributes.
+        :param event: If specified, attributes of this event are updated rather than creating a new one with factory.
+        :returns: `event` or a new instance of the factory class.
         """
-        match = self.prefix.match(text)
-        if not match:
-            return factory()
-        prefix = match.group(0)
-
-        # chain is to ensure there's always at least two elements by adding some dummy ones.
-        search, text, *_ = itertools.chain(self.separator.split(text[match.end(0):], 1), ['']*2)
-        return factory(prefix=prefix, name=search, command=self.lookup(search), text=text)
+        if event is None:
+            event = factory()
+        match = self.match(text)
+        if match:
+            self.update_event(match, event)
+        return event
 
 
 # noinspection PyShadowingNames
@@ -1121,11 +1152,11 @@ class Command:
         if not self.name and self.aliases:
             self.name = self.aliases[0]
 
-    def __call__(self, invocation, *args, **kwargs):
+    def __call__(self, event, *args, **kwargs):
         """
         Calls bound functions until one returns or raises FinalUsageError.
 
-        :param invocation: A :class:`Invocation` instance representing information we were called with.
+        :param event: A :class:`Event` instance representing information we were called with.
 
         All arguments are passed to `Binding.__call__`
         """
@@ -1135,7 +1166,7 @@ class Command:
         error_binding, error = None, None
         for binding in self.bindings:
             try:
-                return binding(invocation, *args, **kwargs)
+                return binding(event, *args, **kwargs)
             except FinalUsageError:
                 raise
             except PrecheckError:
@@ -1147,7 +1178,7 @@ class Command:
         if self.usage:
             raise UsageError(self.usage)
         elif not error.message:
-            raise UsageError("Usage: {command} {usage}".format(command=invocation.full_name, usage=error_binding.usage))
+            raise UsageError("Usage: {command} {usage}".format(command=event.full_name, usage=error_binding.usage))
         raise error
 
     @classmethod
@@ -1169,7 +1200,7 @@ class Command:
         for attr in ('category', 'usage'):
             kwargs.setdefault(attr, getattr(pending, attr))
         # doc is tricky.
-        doc = listify(kwargs.get('doc'))
+        doc = ircbot.util.listify(kwargs.get('doc'))
         doc.extend(reversed(pending.doc or []))
         kwargs['doc'] = "\n".join(doc)
 
@@ -1300,7 +1331,7 @@ def bind(fn, paramstring='', summary=None, label=None, precheck=None, wrapper=No
     :param paramstring: Parameter string.
     :param summary: Optional usage summary for help.
     :param label: Optional label
-    :param precheck: Optional function that receives a :class:`Invocation` and returns True or False if the binding
+    :param precheck: Optional function that receives a :class:`Event` and returns True or False if the binding
         should run.
     :param wrapper: If not None, the called function will be wrapped by this one.
     :param function: Overrides fn if present.  Convenience method for decorator chaining.

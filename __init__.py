@@ -17,7 +17,8 @@ import pydle
 
 import ircbot.commands
 import ircbot.usertrack
-from ircbot.util import Throttle
+import ircbot.util
+from ircbot.util import Throttle, DependencyItem, DependencyDict
 import tornado.locks
 
 
@@ -86,7 +87,7 @@ class MainConfigSection(ConfigSection):
         self.verify_ssl = section.getboolean('verify_ssl', True)
         self.realname = section.get('realname', self.nicknames[0])
         self.username = section.get('username', self.nicknames[0])
-        self.prefix = re.compile(section.get('prefix', '!'))
+        self.prefix = section.get('prefix', '!')
         self.wrap_length = section.getint('wrap_length', 400)
         self.wrap_indent = section.get('wrap_indent', '...')
 
@@ -107,9 +108,7 @@ class MainConfigSection(ConfigSection):
             channel = channel.strip()
             if not channel:
                 continue
-            d = {'password': None}
-            d.update(zip(('channel', 'password'), channel.split('=', 1)))
-            channels.append(d)
+            channels.append(dict(zip('channel', 'password'), ircbot.util.pad(channel.split('=', 1), 2)))
         self.channels = channels
 
         for attr in (
@@ -215,7 +214,7 @@ class Config:
 class EventEmitter(pydle.Client):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
-        self.events = collections.defaultdict(list)
+        self.events = collections.defaultdict(DependencyDict)
 
     def emit(self, _event, *args, **kwargs):
         """
@@ -270,22 +269,23 @@ class EventEmitter(pydle.Client):
             self.emit('raw_' + cmd.lower())
         return super().on_raw(message)
 
-    def on(self, event, fn=None, prepend=False):
+    def on(self, event, key=None, fn=None, **kwargs):
         """
         Calls fn upon the specified event.  If fn is None, returns a decorator
 
         :param event: Event name.
+        :param key: Key to identify this event handler.  Defaults to fn if omitted.
         :param fn: Function to call.  If None, returns a decorator
-        :param prepend: If True, adds to the beginning of the list rather than the end.
+        :param kwargs: Passed to the DependencyItem's constructor to force events to run in a specific order.
+
         :returns: Decorator or `fn`
         """
         if fn is None:
-            return functools.partial(self.on, event, prepend=prepend)
-        if prepend:
-            self.events[event].insert(0, fn)
-        else:
-            self.events[event].append(fn)
-
+            return functools.partial(self.on, event, key, **kwargs)
+        if key is None:
+            key = fn
+        self.events[event].add(key, data=fn, **kwargs)
+        return fn
 
 def _add_emitter(attr):
     fn = getattr(EventEmitter, attr)
@@ -303,6 +303,16 @@ def _add_emitter(attr):
 for _attr in filter(lambda x: x.startswith('on_') and not x.startswith('on_raw_') and x != 'on_raw', dir(EventEmitter)):
     _add_emitter(_attr)
 del _add_emitter
+
+
+class Registry(ircbot.commands.Registry):
+    """
+    Superclasses the generic Registry with a dispatch method.
+    """
+    def dispatch(self, event):
+        self.update_event(event.result, event)
+        if event.command:
+            return event.command(event)
 
 
 class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
@@ -332,13 +342,14 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         ):
             kwargs.setdefault(attr, getattr(main, attr))
 
-        self.command_registry = commands.Registry(prefix=main.prefix)
         super().__init__(**kwargs)
-        self.events = collections.defaultdict(list)
         self.global_throttle = Throttle(self.config.throttle.burst, self.config.throttle.rate)
         self.target_throttles = {}
         self.throttle_lock = tornado.locks.Lock()
-        self.rules = []
+        self.rules = DependencyDict()
+
+        self.command_registry = Registry(prefix=main.prefix)
+        self.rule(self.command_registry.match, key='commands', fn=self.command_registry.dispatch)
 
         self.textwrapper = textwrap.TextWrapper(
             width=main.wrap_length, subsequent_indent=main.wrap_indent,
@@ -419,19 +430,37 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
             throttle.reset()
         self.global_throttle.reset()
 
-    def rule(self, pattern, fn=None):
+    def rule(self, pattern, key=None, flags=re.IGNORECASE, attr='fullmatch', fn=None, **kwargs):
         """
-        Calls the decorated function if a message matches 'pattern'
-        :param pattern: String or regex
-        :param fn: Function to call.  Returns decorator if None.
-        :return: fn or decorator
+        Calls fn when text matches the specified pattern.  If fn is None, returns a decorator
+
+        :param pattern: Pattern to match.
+        :param key: Key to identify this rule.  Defaults to `fn` if omitted.
+        :param flags: Flags used when compiling regular expressions.  Only used if `pattern` is a `str`
+        :param attr: Name of the method on a compiled regex that actually does matching.  'match', 'fullmatch',
+            'search', 'findall` and `finditer` might be good choices.
+        :param fn: Function to call.  If None, returns a decorator
+        :param kwargs: Passed to the DependencyItem's constructor to force rules to run in a specific order.
+        :returns: Decorator or `fn`
+
+        pattern can be:
+        - a compiled regular expression, which will be tested using pattern.fullmatch(...)
+        - a string, which will be compiled into a regular expression and then tested using the above.
+        - a callable, which returns True (or something evaluating as True) if the result succeeds.
+
+        The result of whatever pattern returns is stored in event.result
         """
+        import re
         if fn is None:
-            return functools.partial(self.rule, pattern)
-        if isinstance(pattern, str):
-            pattern = re.compile(pattern)
-        self.rules.append((pattern, fn))
-        return fn
+            return functools.partial(self.rule, pattern, key, flags, attr, **kwargs)
+        if not callable(pattern):
+            if isinstance(pattern, str):
+                pattern = re.compile(pattern, flags)
+            pattern = getattr(pattern, attr)
+        if key is None:
+            key = fn
+        kwargs['data'] = (pattern, fn)
+        self.rules.add(key, **kwargs)
 
     def command(self, *args, **kwargs):
         """
@@ -567,35 +596,31 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         :param irc_command: PRIVMSG or NOTICE
         :param target: Message target
         :param nick: Nickname of sender
-        :param message: Messge
+        :param message: Message
         :return:
         """
-        super().on_message(target, nick, message)
         channel = target if self.is_channel(target) else None
         factory = functools.partial(
             self.event_factory, bot=self, irc_command=irc_command, nick=nick, channel=channel, message=message
         )
 
-        for pattern, fn in self.rules:
-            match = pattern.match(message)
-            if match:
-                event = factory(command=fn, text=message, match=match)
+        for rule, item in self.rules.items():
+            pattern, fn = item.data
+            result = pattern(message)
+            if result:
+                event = factory(rule=rule, result=result)
                 with self.log_exceptions(target):
-                    result = event()
-                    if isinstance(result, pydle.Future):
-                        yield result
-
-        event = self.command_registry.parse(message, factory=factory)
-        if event.command:
-            with self.log_exceptions(target):
-                try:
-                    result = event()
-                    if isinstance(result, pydle.Future):
-                        yield result
-                except ircbot.commands.UsageError as ex:
-                    self.notice(nick, str(ex))
+                    try:
+                        result = fn(event)
+                        if isinstance(result, pydle.Future):
+                            yield result
+                    except StopHandling:
+                        break
+                    except ircbot.commands.UsageError as ex:
+                        self.notice(nick, str(ex))
 
     def on_message(self, target, nick, message):
+        super().on_message(target, nick, message)
         return self.handle_message('PRIVMSG', target, nick, message)
 
 
@@ -627,7 +652,7 @@ def _implied_target_user(method):
     return wrapper
 
 
-class Event(ircbot.commands.Invocation):
+class Event(ircbot.commands.Event):
     """
     Passed to command and rule functions when magic happens.
     """
@@ -635,7 +660,8 @@ class Event(ircbot.commands.Invocation):
     def __init__(
             self,
             prefix=None, name=None, command=None, text=None,
-            bot=None, irc_command=None, nick=None, channel=None, match=None, message=None
+            bot=None, irc_command=None, nick=None, channel=None, message=None,
+            rule=None, result=None,
     ):
         """
         Creates a new :class:`Event`
@@ -648,16 +674,18 @@ class Event(ircbot.commands.Invocation):
         :param irc_command: IRC command name (e.g. PRIVMSG)
         :param nick: Triggering nickname
         :param channel: Triggering channel, or None for PMs.
-        :param match: Triggering pattern (for rule matches)
         :param message: Full IRC message
+        :param rule: The rule that matched.
+        :param result: The result of the rule's match function.
         """
         super().__init__(prefix=prefix, name=name, command=command, text=text)
         self.bot = bot
         self.irc_command = irc_command
         self.nick = nick
         self.channel = channel
-        self.match = match
         self.message = message
+        self.rule = rule
+        self.result = result
 
     @classmethod
     def from_parseresult(cls, bot, name, nick, channel, result):
@@ -746,3 +774,8 @@ class Event(ircbot.commands.Invocation):
         return getattr(self.bot, item)
 
 
+class StopHandling(BaseException):
+    """
+    Raise to stop subsequent patterns from handling a command.
+    """
+    pass

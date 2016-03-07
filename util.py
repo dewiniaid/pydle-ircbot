@@ -3,16 +3,16 @@ import collections
 import collections.abc
 import datetime
 import functools
+import concurrent.futures
+import asyncio
+import itertools
 
 import tornado.locks
 import tornado.gen
-import pydle.async
 import tornado.concurrent
-import concurrent.futures
-import asyncio
-import operator
+import pydle.async
 
-__all__ = ["listify"]
+__all__ = ["listify", "pad", "DependencyDict", "DependencyItem", "Throttle"]
 
 def listify(x):
     """
@@ -31,6 +31,26 @@ def listify(x):
     if isinstance(x, (str, bytes)):
         return [x]
     return x
+
+
+def pad(iterable, size, padding=None):
+    """
+    Yields items from iterable, and then yields `padding` enough times to have yielded a total of `size` items.
+
+    Designed for cases where you might want to write ``foo, bar, baz = "foo,bar".split(",")`` and dont to special case
+    the tuple unpacking.
+
+    Note that if iterable has more than size elements, they will still all be returned.
+
+    :param iterable: Iterable to yield from.
+    :param size: Number of elements to yield.
+    :param padding: What to yield after the iterator is exhausted.
+    """
+    for item in iterable:
+        yield item
+        size -= 1
+    if size > 0:
+        yield from itertools.repeat(padding, size)
 
 
 class Throttle:
