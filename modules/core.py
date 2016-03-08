@@ -14,10 +14,11 @@ To override settings, use command.export(...) or set the appropriate class attri
         Function that takes an event and a message and produces the appropriate reply.  The default implementation
         sends a NOTICE to the target nick.
 """
-from ircbot.commands import Command, command, alias, bind, doc
+from ircbot.commands import Command, Pattern, command, alias, bind, doc
 import functools
 import itertools
 import textwrap
+
 
 def default_reply(event, message):
     """Default function called to reply to bot commands."""
@@ -89,7 +90,12 @@ def help_command(event, name=None, full=False):
         for index, line in enumerate(usage_lines(command, name)):
             reply(((' ' * len(usage_string)) if index else usage_string) + line)
 
-        aliases = list(event.prefix + item for item in command.aliases if item != command.name)
+        aliases = []
+        for alias in command.aliases:
+            if isinstance(alias, Pattern):
+                alias = alias.doc
+            if alias and alias != command.name:
+                aliases.append(event.prefix + alias)
         if aliases:
             reply("Aliases: " + ", ".join(aliases))
 
@@ -105,7 +111,7 @@ def help_command(event, name=None, full=False):
     ).wrap
 
     # Build unique list of commands
-    commands = set(filter(command_filter, itertools.chain(registry.aliases.values(), registry.patterns.values())))
+    commands = set(filter(command_filter, registry.commands))
 
     reply("For detailed help on a specific command, use {} <command>".format(event.full_name))
     # Sort it and group by category

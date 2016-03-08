@@ -108,7 +108,7 @@ class MainConfigSection(ConfigSection):
             channel = channel.strip()
             if not channel:
                 continue
-            channels.append(dict(zip('channel', 'password'), ircbot.util.pad(channel.split('=', 1), 2)))
+            channels.append(dict(zip(('channel', 'password'), ircbot.util.pad(channel.split('=', 1), 2))))
         self.channels = channels
 
         for attr in (
@@ -119,6 +119,7 @@ class MainConfigSection(ConfigSection):
 
 
 class ThrottleConfigSection(ConfigSection):
+    # noinspection PyAttributeOutsideInit
     def read(self, section):
         def parse_float(value, default=None):
             if not value:
@@ -287,6 +288,7 @@ class EventEmitter(pydle.Client):
         self.events[event].add(key, data=fn, **kwargs)
         return fn
 
+
 def _add_emitter(attr):
     fn = getattr(EventEmitter, attr)
     if not callable(fn):
@@ -410,17 +412,6 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
                 pass
         self.eventloop.schedule(self.global_throttle.run)
 
-    def show_throttle_status(self):
-        try:
-            con = self.connection
-            print("throttle={con.throttle!r}, throttling={con.throttling!r}, handling={handling!r}, qout={qout}".format(
-                con=con, qout=len(con.send_queue),
-                handling=con.eventloop.handles_write(con.socket.fileno(), con._on_write),
-            ))
-        except Exception as ex:
-            import traceback
-            traceback.print_exc()
-
     def on_disconnect(self, expected):
         # Clean up pending triggers
         while self.target_throttles:
@@ -429,12 +420,13 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
             print("Cleaning up event queue for {!r} ({} pending items)".format(target, len(throttle.queue)))
             throttle.reset()
         self.global_throttle.reset()
+        super().on_disconnect(expected)
 
     def rule(self, pattern, key=None, flags=re.IGNORECASE, attr='fullmatch', fn=None, **kwargs):
         """
         Calls fn when text matches the specified pattern.  If fn is None, returns a decorator
 
-        :param pattern: Pattern to match.
+        :param pattern: Pattern to match.  Can be anything accepted by :meth:`ircbot.util.patternize`
         :param key: Key to identify this rule.  Defaults to `fn` if omitted.
         :param flags: Flags used when compiling regular expressions.  Only used if `pattern` is a `str`
         :param attr: Name of the method on a compiled regex that actually does matching.  'match', 'fullmatch',
@@ -443,20 +435,11 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         :param kwargs: Passed to the DependencyItem's constructor to force rules to run in a specific order.
         :returns: Decorator or `fn`
 
-        pattern can be:
-        - a compiled regular expression, which will be tested using pattern.fullmatch(...)
-        - a string, which will be compiled into a regular expression and then tested using the above.
-        - a callable, which returns True (or something evaluating as True) if the result succeeds.
-
-        The result of whatever pattern returns is stored in event.result
+        The result of whatever the pattern returns is stored in event.result, provided it is Truthy.
         """
-        import re
         if fn is None:
             return functools.partial(self.rule, pattern, key, flags, attr, **kwargs)
-        if not callable(pattern):
-            if isinstance(pattern, str):
-                pattern = re.compile(pattern, flags)
-            pattern = getattr(pattern, attr)
+        pattern = ircbot.util.patternize(pattern)
         if key is None:
             key = fn
         kwargs['data'] = (pattern, fn)
@@ -652,6 +635,7 @@ def _implied_target_user(method):
     return wrapper
 
 
+# noinspection PyIncorrectDocstring
 class Event(ircbot.commands.Event):
     """
     Passed to command and rule functions when magic happens.
@@ -757,16 +741,12 @@ class Event(ircbot.commands.Event):
 
     @property
     def target(self):
-        """
-        Returns the channel that invoked this (if any), otherwise the sender
-        """
+        """Returns the channel that invoked this (if any), otherwise the sender"""
         return self.channel or self.nick
 
     @property
     def user(self):
-        """
-        Returns the userdata for the triggering nick.
-        """
+        """Returns the userdata for the triggering nick."""
         return self.bot.users.get(self.nick)
 
     def __getattr__(self, item):

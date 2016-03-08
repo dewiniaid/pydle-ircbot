@@ -6,13 +6,15 @@ import functools
 import concurrent.futures
 import asyncio
 import itertools
+import re
 
 import tornado.locks
 import tornado.gen
 import tornado.concurrent
 import pydle.async
 
-__all__ = ["listify", "pad", "DependencyDict", "DependencyItem", "Throttle"]
+__all__ = ["listify", "pad", "DependencyDict", "DependencyItem", "Throttle", "patternize"]
+
 
 def listify(x):
     """
@@ -37,7 +39,7 @@ def pad(iterable, size, padding=None):
     """
     Yields items from iterable, and then yields `padding` enough times to have yielded a total of `size` items.
 
-    Designed for cases where you might want to write ``foo, bar, baz = "foo,bar".split(",")`` and dont to special case
+    Designed for cases where you might want to write ``foo, bar, baz = "foo,bar".split(",")`` and don't to special case
     the tuple unpacking.
 
     Note that if iterable has more than size elements, they will still all be returned.
@@ -144,6 +146,8 @@ class Throttle:
         """
         Adds the collection of items to the queue.
 
+        :param items: Iterable of items to add.
+
         Each item in the collection can be one of the following structures:
 
         - A callable, in which case this is equivalent to ``self.add(1, item)``
@@ -167,6 +171,8 @@ class Throttle:
     def is_future(self, value):
         """
         Returns True if the value is something we consider a future.
+
+        :param value: Value to test.
         """
         return isinstance(value, self._FUTURE_CLASSES)
 
@@ -266,8 +272,9 @@ class Throttle:
         self.clear()
 
 
-class DependencyItem(collections.namedtuple('_DependencyItem', ['before', 'after', 'requires', 'required_by', 'data'])):
-    def __new__(cls, before=None, after=None, required_by=None, requires=None, data=None):
+class DependencyItem(
+    collections.namedtuple('_DependencyItem', ['before', 'after', 'requires', 'required_by', 'priority', 'data'])):
+    def __new__(cls, before=None, after=None, required_by=None, requires=None, priority=0, data=None):
         """
         Creates a new :class:`DependencyItem`
 
@@ -275,6 +282,7 @@ class DependencyItem(collections.namedtuple('_DependencyItem', ['before', 'after
         :param after: This item will be after these items (if they exist)
         :param required_by: Same as `before`, but the items must exist.
         :param requires: Same as `after`, but the items must exist.
+        :param priority: Priority.  All items in the same priority will be grouped together.
         :param data: Optional data to associate.
         :return: A new :class:`DependencyItem`
 
@@ -287,7 +295,34 @@ class DependencyItem(collections.namedtuple('_DependencyItem', ['before', 'after
         after = set(after) if after else set()
         required_by = set(required_by) if required_by else set()
         requires = set(required_by) if required_by else set()
-        return super().__new__(cls, before, after, required_by, requires, data)
+        # noinspection PyTypeChecker
+        return super().__new__(cls, before, after, required_by, requires, priority, data)
+
+
+@functools.total_ordering
+class _DependencyPriority:
+    """Internal class used to identify dependency groups."""
+    def __init__(self, name):
+        self.name = name
+
+    def __repr__(self):
+        return "{0.__class__.__name__}({0.name!r})".format(self)
+
+    def __hash__(self):
+        return hash(self.name) ^ 0x20160307  # Arbitrary-ish xor
+
+    def __eq__(self, other):
+        if not isinstance(other.__class__, self.__class__):
+            raise TypeError
+        return self.name == other.name
+
+    def __le__(self, other):
+        if not isinstance(other.__class__, self.__class__):
+            raise TypeError
+        return self.name < other.name
+
+    def __len__(self, other):
+        return self.name < other.name
 
 
 class DependencyDict(collections.abc.MutableMapping):
@@ -320,13 +355,17 @@ class DependencyDict(collections.abc.MutableMapping):
     )
 
     __marker = object()
-    def __init__(self, key=False):
+
+    def __init__(self, key=False, get_priority=True):
         """
         Creates a new :class:`DependencyDict`.
         :param key: If `False`, no sorting is performed other than what dependency solving required.  Otherwise, passed
         as-is to functions that perform sorting.
+        :param get_priority: If `False`, dependencies are not sorted by priority.  Otherwise, follows the same semantics
+            as `key` but receives the priority attribute as its argument.
         """
         self.sortkey = key
+        self.get_priority = get_priority
         self._data = collections.OrderedDict()
         self._solved = False  # True if we've performed sorting and whatnot.
         self._passes = None  # How many passes solving took.
@@ -401,8 +440,17 @@ class DependencyDict(collections.abc.MutableMapping):
 
     def solve(self):
         """Solves dependencies and performs a topological sort."""
+        if not self._data:
+            self._solved = True
+            return
         pending = collections.OrderedDict((k, set()) for k in self._data)
         keys = pending.keys()
+        if self.get_priority:
+            priorities = collections.defaultdict(list)
+            get_priority = self.get_priority if callable(self.get_priority) else lambda x: x
+        else:
+            priorities = None
+            get_priority = None
 
         # Validate everything and set up pending.
         for k, v in self._data.items():
@@ -425,6 +473,27 @@ class DependencyDict(collections.abc.MutableMapping):
                     continue
                 pending[k].update(overlap)
 
+            if get_priority:
+                priorities[get_priority(v.priority)].append(k)
+
+        # Sort groups and handle dependencies
+        # We handle group dependencies by:
+        # a) Making all members of a group dependent on the previous group.
+        # b) Making the group dependent on all members of the group.
+        if priorities and len(priorities) == 1:  # Ignore the overhead if there's only one group.
+            priorities = None
+            get_priority = None
+
+        if priorities:
+            prev = None
+            for priority in sorted(priorities.keys()):
+                members = set(priorities[priority])
+                if prev:
+                    for member in members:
+                        pending[member].add(prev)
+                pending[priority] = set(members)
+                prev = priority
+
         # Actually solve.
         solution = []
         n = 0
@@ -440,12 +509,15 @@ class DependencyDict(collections.abc.MutableMapping):
                     "Could not solve dependencies on pass {} ({} items remaining)".format(n, len(pending)),
                     n, len(pending)
                 )
+
             solution.extend(solved)
             for item in solved:
                 del pending[item]
             for v in pending.values():
                 v.difference_update(solved)
-        self._data = collections.OrderedDict((k, self._data[k]) for k in solution)
+        self._data = collections.OrderedDict(
+            (k, self._data[k]) for k in solution if not isinstance(k, _DependencyPriority)
+        )
         self._solved = True
         self._passes = n
 
@@ -473,22 +545,49 @@ class DependencyDict(collections.abc.MutableMapping):
         return len(self._data)
 
 
-if __name__ == '__main__':
-    dset = DependencyDict(key=lambda x: -x[0])
+def patternize(pattern, flags=re.IGNORECASE, attr='fullmatch'):
+    """
+    Converts `pattern` to a function that accepts a single argument and returns True if the argument matches.
 
-    ct = 1000
-    import random
-    for ix in range(ct):
-        obj = ix
-        before = set()
-        after = set()
-        pending = set()
+    :param pattern: Pattern to convert.  Either a string (which will be converted to a regex), a regex, or a callable.
+    :param flags: Flags used when compiling regular expressions.  Only used if `pattern` is a `str`
+    :param attr: Name of the method on a compiled regex that actually does matching.  'match', 'fullmatch', 'search',
+    'findall` and `finditer` might be good choices.
+    :return: a callable.
 
-        # Decide what our odds of having 'before' items are.
-        p = ix/(ct-1)
-        if random.random() > (0.85 * p):
-            after = set(random.sample(range(0, ix), random.randrange(1 + int(0.10*ix))))
-        if random.random() > (0.65 * (1-p)):
-            before = set(random.sample(range(ix+1, ct), random.randrange(1 + int(0.10*(ct - ix - 1)))))
-        dset.add(obj, before, after)
-    print(", ".join(str(x) for x in dset))
+
+    pattern can be:
+    - a compiled regular expression, which will be tested using pattern.fullmatch(...) (or another attr if specified.)
+    - a string, which will be compiled into a regular expression and then tested using the above.
+    - a callable, which returns True (or something evaluating as True) if the result succeeds.
+
+    The result of whatever pattern returns is stored in event.result
+    """
+    if not callable(pattern):
+        if isinstance(pattern, str):
+            pattern = re.compile(pattern, flags)
+        pattern = getattr(pattern, attr)
+    return pattern
+#
+#
+# if __name__ == '__main__':
+#     dset = DependencyDict(key=lambda x: -x[0])
+#
+#     ct = 1000
+#     import random
+#     for ix in range(ct):
+#         obj = ix
+#         before = set()
+#         after = set()
+#         pending = set()
+#
+#         # Decide what our odds of having 'before' items are.
+#         p = ix/(ct-1)
+#         if random.random() > (0.85 * p):
+#             after = set(random.sample(range(0, ix), random.randrange(1 + int(0.10*ix))))
+#         if random.random() > (0.65 * (1-p)):
+#             before = set(random.sample(range(ix+1, ct), random.randrange(1 + int(0.10*(ct - ix - 1)))))
+#         dset.add(obj, before, after)
+#     print(", ".join(str(x) for x in dset))
+#
+

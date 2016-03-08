@@ -54,7 +54,7 @@ __all__ = [
     'Argument', 'ArgumentList',
     'Binding', 'register_type', 'ParamType', 'ConstParamType', 'StrParamType', 'NumberParamType',
     'UsageError', 'FinalUsageError', 'ParseError',
-    'Command', 'PendingCommand', 'wrap_decorator', 'chain_decorator', 'command', 'alias', 'bind', 'match', 'doc'
+    'Command', 'PendingCommand', 'wrap_decorator', 'chain_decorator', 'command', 'alias', 'bind', 'Pattern', 'doc'
 ]
 
 
@@ -423,7 +423,6 @@ class Binding:
         :param paramstring: The parameter string to interpret.
         :param label: Name of this binding.  Optional.
         :param summary: Optional short summary of usage.
-        :param command: Command that we're attached to.
         :param precheck: Optional function that takes a :class:`Event` and returns True if we should even be
             considered for evaluation.
         """
@@ -599,8 +598,8 @@ class Binding:
             else:
                 kwargs[self.binding_arg] = self
         if (
-                        len(event.arglist) > len(self.params) and
-                    (not self.params or not (self.params[-1].eol or self.params[-1].listmode))
+            len(event.arglist) > len(self.params) and
+            (not self.params or not (self.params[-1].eol or self.params[-1].listmode))
         ):
             raise UsageError("Incorrect number of arguments.")
 
@@ -916,16 +915,11 @@ class Event:
 
     @property
     def full_name(self):
-        """
-        Returns the full command name used.  (Essentially prefix + command)
-        """
+        """Returns the full command name used.  (Essentially prefix + command)"""
         return self.prefix + self.name
 
-
     def __bool__(self):
-        """
-        Returns True if `self.command` is not None
-        """
+        """Returns True if `self.command` is not None"""
         return self.command is not None
 
     @property
@@ -947,21 +941,21 @@ class Registry:
     """
     Registers commands and serves as the intermediary between command and interface.
 
-    :ivar aliases: Dictionary of alias -> command.
-    :ivar patterns: Dictionary of patterns -> commands
+    :ivar aliases: Dictionary of string aliases -> command.
+    :ivar patterns: :class:`DependencyDict` of pattern info
     :ivar regex: Pattern that matches commands.  Should have named groups 'prefix', 'name', and 'text'
     """
 
     #: Default pattern for regex matching.  %% will be replaced by the prefix regex.
     DEFAULT_PATTERN = '(?P<prefix>!)(?P<name>\S+)(?:\s+?(?P<text>\S+)\s*)?'
 
-    def __init__(self, prefix=None, pattern=None):
+    def __init__(self, prefix=None, pattern=None, cachesize=1024):
         """
         :param prefix: Partial regular expression that matches the beginning of a command.  Will be compiled into a
             more complete regular expression.  Optional if 'match' is not specified.
         :param pattern: Regular expression that matches a line of text and breaks it into named groups "prefix", "name",
         and "text".  (At least "name" and "text" must be present.)
-        :param separator: Regular expression that separates the command from its argument list.
+        :param cachesize: Size of the lookup cache for pattern-based commands.
         """
         if pattern is None:
             if prefix is None:
@@ -981,7 +975,12 @@ class Registry:
         self.has_prefix = 'prefix' in t
         self.regex = pattern
         self.aliases = {}
-        self.patterns = {}
+        self.patterns = ircbot.util.DependencyDict()
+        self.commands = set()
+
+        self.pattern_lookup = self._pattern_lookup  # Replaced by the cache the first time it is invalidated.
+        self._cache = 0
+        self.cache = cachesize  # Which is... here.
 
     def register(self, *commands):
         """
@@ -989,15 +988,54 @@ class Registry:
 
         :param commands: Command(s) to add.
         """
-        for command in commands:
-            aliases = set(alias.lower() for alias in command.aliases)
-            if command.name:
-                aliases.add(command.name.lower())
-            for alias in aliases:
-                if alias in self.aliases:
-                    raise ValueError("Duplicate command alias {!r}".format(alias))
-            self.aliases.update(zip(aliases, itertools.repeat(command)))
-            self.patterns.update(zip(command.patterns, itertools.repeat(command)))
+        invalidate = False
+        try:
+            for command in commands:
+                aliases = set(alias.lower() for alias in command.aliases if not isinstance(alias, Pattern))
+                if command.name:
+                    aliases.add(command.name.lower())
+                dupes = aliases.intersection(aliases, self.aliases.keys())
+                if dupes:
+                    raise ValueError("Duplicate command alias {!r}".format(dupes.pop()))
+                self.aliases.update(zip(aliases, itertools.repeat(command)))
+                for pattern in filter(lambda x: isinstance(x, Pattern), command.aliases):
+                    invalidate = True
+                    key = pattern if pattern.key is None else pattern.key
+                    self.patterns.add(key, data=(pattern.pattern, command), **pattern.item_kwargs)
+                self.commands.add(command)
+        finally:
+            if invalidate:
+                self.invalidate_cache()
+
+    @property
+    def cache(self):
+        return self._cache
+
+    @cache.setter
+    def cache(self, value):
+        self._cache = value
+        if value:
+            self.pattern_lookup = functools.lru_cache(value, typed=True)(self._pattern_lookup)
+        else:
+            self.pattern_lookup = self._pattern_lookup
+
+    def invalidate_cache(self):
+        if hasattr(self.pattern_lookup, 'cache_clear'):
+            # noinspection PyUnresolvedReferences
+            self.pattern_lookup.cache_clear()
+
+    def _pattern_lookup(self, search):
+        """
+        Searches for 'search' against all patterns and returns the matching command.
+
+        :param search: Command to search for.
+        :returns: A :class:`Command`, or None.
+        """
+        for value in self.patterns.values():
+            match, command = value.data
+            if match(search):
+                return command
+        return None
 
     def lookup_all(self, search):
         """
@@ -1013,16 +1051,19 @@ class Registry:
 
     def lookup(self, search):
         """
-        Searches for 'search' against all registered commands.  Returns the first matching result.  If multiple patterns
-        match and no aliases do, the definition of 'first' matching result is undefined.
+        Searches for 'search' against all registered commands.  Returns the first matching result.
+
+        If multiple patterns match and no aliases do, the definition of 'first' matching result is undefined (unless
+        the patterns are explicitly ordered)
 
         :param search: Command to search for.
         :returns: A :class:`Command`, or None.
         """
-        return next(self.lookup_all(search), None)
-
-    def split_command(self, text):
-        return ircbot.util.pad(self.separator.split(text, 1), 2, '')
+        search = search.lower().strip()
+        command = self.aliases.get(search)
+        if command:
+            return command
+        return self.pattern_lookup(search)
 
     def match(self, text):
         result = self.regex.fullmatch(text)
@@ -1062,6 +1103,39 @@ class Registry:
         if match:
             self.update_event(match, event)
         return event
+
+
+class Pattern:
+    """
+    Represents a pattern attached to a command.
+    """
+
+    # noinspection PyShadowingNames
+    def __init__(
+            self, pattern, key=None, doc=None, flags=re.IGNORECASE, attr='fullmatch',
+            **kwargs
+    ):
+        """
+        Creates a new `Pattern`
+
+        Patterns are added to commands as a way to perform regex matching or some other special logic for looking up
+        commands.  For simple text matches, you should use aliases instead.
+
+        :param pattern: Pattern definition.  Passed to :meth:`ircbot.util.patternize()`
+        :param key: Optional identifier for this definition, used for ordering dependencies.
+        :param doc: A pseudo-alias for this pattern for use in documentation.  Omitted from documentation if None.
+        :param flags: Regex flags if a regex is compiled.  Passed to :meth:`ircbot.util.patternize()`
+        :param attr: Regex object attribute.  Passed to :meth:`ircbot.util.patternize()`
+        :param kwargs: Passed to :class:`DependencyItem`
+        :return:
+        """
+        self.pattern = ircbot.util.patternize(pattern, flags, attr)
+        self.key = key
+        self.doc = doc
+        self.item_kwargs = kwargs
+
+    def __repr__(self):
+        return "<{}({!r})>".format(self.__class__.__name__, self.key or self.pattern)
 
 
 # noinspection PyShadowingNames
@@ -1145,12 +1219,11 @@ class Command:
         """
         if self._done:
             return
-        for ix, pattern in enumerate(self.patterns):
-            if hasattr(pattern, 'pattern'):  # Compiled regex.
-                continue
-            self.patterns[ix] = re.compile(pattern, re.IGNORECASE)
-        if not self.name and self.aliases:
-            self.name = self.aliases[0]
+        if not self.name:
+            for alias in self.aliases:
+                if not isinstance(alias, Pattern):
+                    self.name = alias
+                    break
 
     def __call__(self, event, *args, **kwargs):
         """
@@ -1180,6 +1253,9 @@ class Command:
         elif not error.message:
             raise UsageError("Usage: {command} {usage}".format(command=event.full_name, usage=error_binding.usage))
         raise error
+
+    def __repr__(self):
+        return "<{}({!r})>".format(self.__class__.__name__, self.name or (self.aliases[0] if self.aliases else None))
 
     @classmethod
     def from_pending(cls, pending, registry=None, **kwargs):
@@ -1284,7 +1360,7 @@ def chain_decorator(fn):
 # noinspection PyShadowingNames
 @wrap_decorator
 def command(
-    fn=None, name=None, aliases=None, patterns=None, bindings=None, doc=None, category=None, usage=None,
+    fn=None, name=None, aliases=None, bindings=None, doc=None, category=None, usage=None,
     registry=None, factory=Command, return_command=False, **kwargs
 ):
     """
@@ -1295,11 +1371,11 @@ def command(
 
     :param fn: Function to decorate, or a :class:`PendingCommand` instance.
     :param name: Command name.
-    :param aliases: List of command aliases
-    :param patterns: Regex patterns.
+    :param aliases: List of command aliases and patterns.
     :param bindings: Bindings.
     :param doc: Helptext.
     :param category: Category.
+    :param usage: Overrides text displayed if a UsageError occurs.
     :param registry: Which :class:`CommandRegistry` the command will be registered in.  None disables registration.
     :param factory: A :class:`Command` subclass or a function that will create the new command.
     :param return_command: If True, returns the new command object rather than the wrapped function.
@@ -1314,7 +1390,7 @@ def command(
 
     created = factory(
         fn, registry,
-        name=name, category=category, usage=usage, aliases=aliases, patterns=patterns, bindings=bindings, doc=doc,
+        name=name, category=category, usage=usage, aliases=aliases, bindings=bindings, doc=doc,
         **kwargs
     )
     if return_command:
@@ -1347,23 +1423,14 @@ def bind(fn, paramstring='', summary=None, label=None, precheck=None, wrapper=No
 @chain_decorator
 def alias(fn, *aliases):
     """
-    Adds one or more aliases (exact string matches) to the pending command.
+    Adds one or more aliases to the pending command.
+
+    Aliases can be strings (in which case they'll be exact string matches) or :class:`Pattern` instances.
 
     :param fn: Function to decorate, or a :class:`PendingCommand` instance.
     :param aliases: One or more aliases to add.
     """
     fn.aliases.extend(reversed(aliases))
-
-
-@chain_decorator
-def match(fn, *patterns):
-    """
-    Adds one or more patterns (regex matches) to the pending command.
-
-    :param fn: Function to decorate, or a :class:`PendingCommand` instance.
-    :param patterns: One or more aliases to add.
-    """
-    fn.patterns.extend(reversed(patterns))
 
 
 @chain_decorator
