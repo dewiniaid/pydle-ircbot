@@ -54,7 +54,8 @@ __all__ = [
     'Argument', 'ArgumentList',
     'Binding', 'register_type', 'ParamType', 'ConstParamType', 'StrParamType', 'NumberParamType',
     'UsageError', 'FinalUsageError', 'ParseError',
-    'Command', 'PendingCommand', 'wrap_decorator', 'chain_decorator', 'command', 'alias', 'bind', 'Pattern', 'doc'
+    'Command', 'PendingCommand', 'from_chain',
+    'wrap_decorator', 'chain_decorator', 'command', 'alias', 'bind', 'Pattern', 'doc'
 ]
 
 
@@ -417,7 +418,7 @@ class Binding:
 
     def __init__(self, function, paramstring='', summary=None, label=None, precheck=None):
         """
-        Creates a new :class:`CommandBinding`.
+        Creates a new :class:`Binding`.
 
         :param function: The function that we bind.
         :param paramstring: The parameter string to interpret.
@@ -1159,7 +1160,6 @@ class Command:
     """
     name = None      # Command name for !help
     aliases = []     # Aliases.  (Case-insensitive string matching)
-    patterns = []    # Patterns.  (Regular expressions or strings that will be compiled into one)
     bindings = []    # Associated command bindings, in order of priority.
 
     def __init__(self, name=None, aliases=None, patterns=None, bindings=None, doc=None, usage=None, category=None):
@@ -1200,7 +1200,7 @@ class Command:
             kwargs.setdefault(attr, getattr(self, attr))
 
         # Attributes we make shallow copies of
-        for attr in ('aliases', 'patterns', 'bindings'):
+        for attr in ('aliases', 'bindings'):
             if attr in kwargs:
                 continue
             kwargs[attr] = getattr(self, attr).copy()
@@ -1286,6 +1286,30 @@ class Command:
             registry.register(rv)
         return rv
 
+    @classmethod
+    def from_chain(cls, fn, *chain):
+        """
+        Occasionally we want to use the decorators in a context where decorators aren't useable -- e.g. when we're
+        creating a command using a `functools.partial` or something similar.
+
+        This takes a list of decorators that haven't yet decorated a function and calls them on the selected function.
+        It's essentially equivalent to::
+
+            for item in reversed(chain):
+                fn = item(fn)
+
+        (The reason for the `reversed` bit is because the decorators already have logic to ensure they apply in top-
+        down order, this counters it.)
+
+        :param fn: Initial function that decorators receive.
+        :param chain: Sequence of decorators.
+        :return: Result of final command.
+        """
+        return functools.reduce(lambda decorator, fn: decorator(fn), chain, fn)
+
+
+from_chain = Command.from_chain
+
 
 class PendingCommand:
     """
@@ -1297,7 +1321,6 @@ class PendingCommand:
         self.function = function
         # These all resemble the Command counterparts, but will be reversed upon being finalized.
         self.bindings = []
-        self.patterns = []
         self.aliases = []
         self.doc = []
         self.usage = None
