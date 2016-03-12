@@ -68,7 +68,7 @@ class Argument(str):
 
     Normally, Arguments should not be constructed directly but instead created in bulk from an ArgumentList.
     """
-
+    __slots__ = ('_text', '_start', '_eol')
     # str subclassing is a pain
     def __new__(cls, s, text, span):
         rv = str.__new__(cls, s)
@@ -206,7 +206,7 @@ class UsageError(Exception):
     """
     Thrown when a command is called with invalid syntax.
     """
-    def __init__(self, message=None, arglist=None, param=None):
+    def __init__(self, message=None, event=None, param=None, final=False):
         """
         Creates a new UsageError.
 
@@ -223,22 +223,36 @@ class UsageError(Exception):
         were still wrong.
 
         :param message: Error message.
-        :param arglist: The ArgumentList that was being parsed.
-        :param param: The Parameter that triggered the error.
+        :param event: The Event that was being parsed.
+        :param param: The Parameter that triggered the error.  May be None
+        :param final: If True, we're treated as 'Final' -- no other command bindings will be attempted.
         """
         self.message = message
-        self.arglist = arglist
+        self.event = event
         self.param = param
+        self.final = final
+
+    def __str__(self):
+        if self.message:
+            return self.message
+        return super().__str__()
+
+
+class RequiredParamError(UsageError):
+    """Thrown when a required parameter was not present."""
+    pass
 
 
 class PrecheckError(UsageError):
     """Thrown when a binding's precheck function returns False."""
-    def __init__(self, message=None, arglist=None, param=None):
-        super().__init__(message or "This command is not available here.", arglist, param)
+    def __init__(self, message=None, event=None, param=None, final=False):
+        super().__init__(message or "This command is not available here.", event, param, final)
 
 
 class FinalUsageError(UsageError):
     """See UsageError"""
+    def __init__(self, message=None, event=None, param=None, final=True):
+        super().__init__(message, event, param, final)
     pass
 
 
@@ -605,10 +619,10 @@ class Binding:
             raise UsageError("Incorrect number of arguments.")
 
         for param in self.params:
-            param.validate(event.arglist)
+            param.validate(event)
 
         for param in self.params:
-            param.bind(event.arglist, args, kwargs)
+            param.bind(event, args, kwargs)
             # Did we get too many arguments?
 
         return self.signature.bind(event, *args, **kwargs)
@@ -679,15 +693,15 @@ class Parameter:
             if not self.listmode:
                 return
 
-    def validate(self, arglist):
+    def validate(self, event):
         """
-        Performs validation of arguments in :class:`ArgumentList` that belong to us.
+        Performs validation of arguments in the event's `ArgumentList` that belong to us.
 
         Gives ParamType handlers a chance to raise a UsageError() before actually invoking the function involved.
 
-        :param arglist: A :class:`ArgumentList`
+        :param event: A :class:`Event`
         """
-        if len(arglist) <= self.index:
+        if len(event.arglist) <= self.index:
             if self.required:
                 if self.listmode:
                     raise UsageError("At least one {name} must be specified".format(name=self.name or '<const>'))
@@ -695,30 +709,30 @@ class Parameter:
             return
         if not self.parser.check:
             return
-        for index, arg in enumerate(self.args(arglist), self.index):
+        for index, arg in enumerate(self.args(event.arglist), self.index):
             try:
-                self.parser.validate(arg.eol if self.parser.eol else arg)
+                self.parser.validate(event, arg.eol if self.parser.eol else arg)
             except UsageError as ex:
-                raise UsageError(ex.message, arglist, index)
+                raise UsageError(ex.message, event.arglist, index)
             except Exception as ex:
                 if self.parser.wrap_exceptions:
                     raise UsageError("Invalid format for {name}") from ex
                 raise
 
-    def bind(self, arglist, args, kwargs):
+    def bind(self, event, args, kwargs):
         """
         Updates the args and kwargs that we'll use to call the bound function based on what the ParamType handler says
 
-        :param arglist: A :class:`ArgumentList`
+        :param event: A :class:`Event`
         :param args: Initial arguments to pass to function
         :param kwargs: Additional keyword arguments to pass to function
         """
         values = []
-        for index, arg in enumerate(self.args(arglist), self.index):
+        for index, arg in enumerate(self.args(event.arglist), self.index):
             try:
-                values.append(self.parser.parse(arg.eol if self.parser.eol else arg))
+                values.append(self.parser.parse(event, arg.eol if self.parser.eol else arg))
             except UsageError as ex:
-                raise UsageError(ex.message, arglist, index)
+                raise UsageError(ex.message, event.arglist, index)
             except Exception as ex:
                 if self.parser.wrap_exceptions:
                     raise UsageError("Invalid format for {}".format(self.name)) from ex
@@ -771,19 +785,21 @@ class ParamType:
         """
         self.param = param
 
-    def parse(self, value):
+    def parse(self, event, value):
         """
         Parses the incoming string and returns the parsed result.
 
+        :param event: `Event` being parsed.
         :param value: Value to parse.
         :return: Parsed result.
         """
         return value
 
-    def validate(self, value):
+    def validate(self, event, value):
         """
         Preparses the incoming string and raises an exception if it fails early validation.
 
+        :param event: Event being parsed.
         :param value: Value to parse.
         :return: Nothing
         """
@@ -805,9 +821,12 @@ class StrParamType(ParamType):
         super().__init__(param)
         self.eol = eol
         if param.options and param.options in ('lower', 'upper'):
-            self.parse = getattr(str, param.options)
+            self.parsefn = getattr(str, param.options)
         else:
-            self.parse = str
+            self.parsefn = str
+
+    def parse(self, event, value):
+        return self.parsefn(value)
 
 
 @Binding.register_type('const')
@@ -818,7 +837,7 @@ class ConstParamType(ParamType):
         """
         Const arguments require that an argument be a case-insensitive exact match for one of the provided inputs.
 
-        :param param: Parameter are bound to.
+        :param param: Parameter we are bound to.
         :param split: Function that splits constant value string into an iterable of allowed values.
 
         param.options dictates allowed constant values, as a string
@@ -828,7 +847,7 @@ class ConstParamType(ParamType):
         if not self.values:
             raise ParseError("Must have at least one constant value.")
 
-    def validate(self, value):
+    def validate(self, event, value):
         if value not in self.values:
             if len(self.values) == 1:
                 fmt = "{name} must equal {values}"
@@ -844,7 +863,7 @@ class NumberParamType(ParamType):
         """
         Number arguments require that their data be a number, potentially within a set range.
 
-        :param param: Parameter are bound to.
+        :param param: Parameter we are bound to.
         :param coerce: Function that coerces 'min', 'max' and the input to integers.
         :param coerce_error: Error message for coercion failures.
 
@@ -870,7 +889,7 @@ class NumberParamType(ParamType):
         if self.minvalue is not None and self.maxvalue is not None and self.minvalue > self.maxvalue:
             raise ParseError("minval > maxval")
 
-    def parse(self, value):
+    def parse(self, event, value):
         try:
             value = self.coerce(value)
         except Exception as ex:
@@ -948,7 +967,7 @@ class Registry:
     """
 
     #: Default pattern for regex matching.  %% will be replaced by the prefix regex.
-    DEFAULT_PATTERN = '(?P<prefix>!)(?P<name>\S+)(?:\s+?(?P<text>\S+)\s*)?'
+    DEFAULT_PATTERN = r'(?P<prefix>!)(?P<name>\S+)(?:\s+(?P<text>.*\S)?\s*)?'
 
     def __init__(self, prefix=None, pattern=None, cachesize=1024):
         """
@@ -1269,7 +1288,7 @@ class Command:
         """
         # Merge the various lists in reverse.  This allows decorators to be interpreted top-down even though they are
         # executed bottom-up.
-        for attr in ('aliases', 'patterns', 'bindings'):
+        for attr in ('aliases', 'bindings'):
             kwargs[attr] = (kwargs.get(attr) or [])
             kwargs[attr].extend(reversed(getattr(pending, attr) or []))
         # Downright default some other attributes
@@ -1305,7 +1324,11 @@ class Command:
         :param chain: Sequence of decorators.
         :return: Result of final command.
         """
-        return functools.reduce(lambda decorator, fn: decorator(fn), chain, fn)
+        for decorator in reversed(chain):
+            fn = decorator(fn)
+        return fn
+
+        return functools.reduce((lambda decorator, fn: decorator(fn)), itertools.chain([fn], reversed(chain)))
 
 
 from_chain = Command.from_chain

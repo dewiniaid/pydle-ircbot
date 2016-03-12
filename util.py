@@ -7,7 +7,6 @@ import concurrent.futures
 import asyncio
 import itertools
 import re
-
 import tornado.locks
 import tornado.gen
 import tornado.concurrent
@@ -321,9 +320,6 @@ class _DependencyPriority:
             raise TypeError
         return self.name < other.name
 
-    def __len__(self, other):
-        return self.name < other.name
-
 
 class DependencyDict(collections.abc.MutableMapping):
     """
@@ -488,6 +484,7 @@ class DependencyDict(collections.abc.MutableMapping):
             prev = None
             for priority in sorted(priorities.keys()):
                 members = set(priorities[priority])
+                priority = _DependencyPriority(priority)
                 if prev:
                     for member in members:
                         pending[member].add(prev)
