@@ -13,6 +13,8 @@ import sys
 import textwrap
 import traceback
 import fractions
+import logging
+
 import pydle
 
 import ircbot.commands
@@ -20,6 +22,8 @@ import ircbot.usertrack
 import ircbot.util
 from ircbot.util import Throttle, DependencyItem, DependencyDict
 import tornado.locks
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigSection(dict):
@@ -180,6 +184,8 @@ class Config:
         if class_ is None:
             return functools.partial(self.section, name)
         if name not in self.sections:
+            if name not in self._parser:
+                self._parser.add_section(name)
             self.sections[name] = class_(self._parser[name])
         return class_
 
@@ -228,7 +234,7 @@ class EventEmitter(pydle.Client):
         if _event not in self.events:
             pass
         for fn in self.events[_event]:
-            self.eventloop.schedule(fn, *args, **kwargs)
+            self.eventloop.schedule(fn, self, *args, **kwargs)
 
     def emit_in(self, _when, _event, *args, **kwargs):
         """
@@ -288,6 +294,17 @@ class EventEmitter(pydle.Client):
         self.events[event].add(key, data=fn, **kwargs)
         return fn
 
+    def off(self, event, key):
+        """
+        Removes the specified key from watching the specified event.
+
+        :param event: Event
+        :param key: Key
+        :return:
+        """
+        if key in self.events[event]:
+            del self.events[event][key]
+
 
 def _add_emitter(attr):
     fn = getattr(EventEmitter, attr)
@@ -345,6 +362,7 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
             kwargs.setdefault(attr, getattr(main, attr))
 
         super().__init__(**kwargs)
+
         self.global_throttle = Throttle(self.config.throttle.burst, self.config.throttle.rate)
         self.target_throttles = {}
         self.throttle_lock = tornado.locks.Lock()
@@ -376,6 +394,7 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         try:
             yield None
         except Exception as ex:
+            self.logger.error(traceback.format_exc())
             traceback.print_exc(file=sys.stderr)
             if target:
                 self.notice(target, str(ex))
@@ -396,7 +415,9 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
             if self.server_index >= len(self.config.main.servers):
                 self.server_index = 0
             kwargs.update(self.config.main.servers[self.server_index])
-        print("Connecting to {hostname}:{port}...".format(hostname=kwargs['hostname'], port=kwargs.get('port', 6667)))
+        self.logger.info(
+            "Connecting to {host}:{port}...".format(host=kwargs['hostname'], port=kwargs.get('port', 6667))
+        )
         return super().connect(**kwargs)
 
     def on_connect(self):
@@ -404,7 +425,7 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         Attempt to join channels on connect.
         """
         super().on_connect()
-        print("Connected.")
+        self.logger.info("Connected.")
         for channel in self.config.main.channels:
             try:
                 self.join(**channel)
@@ -414,10 +435,15 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
 
     def on_disconnect(self, expected):
         # Clean up pending triggers
+        if expected:
+            self.logger.info("Disconnected from server (expected).")
+        else:
+            self.logger.error("Disconnected from server unexpectedly.")
+
         while self.target_throttles:
             target, throttle = self.target_throttles.popitem()
             throttle.on_clear = None
-            print("Cleaning up event queue for {!r} ({} pending items)".format(target, len(throttle.queue)))
+            self.logger.debug("Cleaning up event queue for {!r} ({} pending items)".format(target, len(throttle.queue)))
             throttle.reset()
         self.global_throttle.reset()
         super().on_disconnect(expected)
@@ -442,6 +468,8 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         pattern = ircbot.util.patternize(pattern)
         if key is None:
             key = fn
+
+        self.logger.debug("Rule {!r}: Match={!r}, Call={!r}".format(key, pattern, fn))
         kwargs['data'] = (pattern, fn)
         self.rules.add(key, **kwargs)
 
@@ -454,7 +482,8 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         :return: fn
         """
         kwargs.setdefault('registry', self.command_registry)
-        return ircbot.commands.command(*args, **kwargs)
+        result = ircbot.commands.command(*args, **kwargs)
+        return result
 
     @pydle.coroutine
     def throttled(self, target, fn, cost=1):
@@ -587,20 +616,21 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
             self.event_factory, bot=self, irc_command=irc_command, nick=nick, channel=channel, message=message
         )
 
-        for rule, item in self.rules.items():
-            pattern, fn = item.data
-            result = pattern(message)
-            if result:
-                event = factory(rule=rule, result=result)
-                with self.log_exceptions(target):
-                    try:
-                        result = fn(event)
-                        if isinstance(result, pydle.Future):
-                            yield result
-                    except StopHandling:
-                        break
-                    except ircbot.commands.UsageError as ex:
-                        self.notice(nick, str(ex))
+        with self.log_exceptions():
+            for rule, item in self.rules.items():
+                pattern, fn = item.data
+                result = pattern(message)
+                if result:
+                    event = factory(rule=rule, result=result)
+                    with self.log_exceptions(target):
+                        try:
+                            result = fn(event)
+                            if isinstance(result, pydle.Future):
+                                yield result
+                        except StopHandling:
+                            break
+                        except ircbot.commands.UsageError as ex:
+                            self.notice(nick, str(ex))
 
     def on_message(self, target, nick, message):
         super().on_message(target, nick, message)

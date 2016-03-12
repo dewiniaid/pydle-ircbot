@@ -14,7 +14,8 @@ To override settings, use command.export(...) or set the appropriate class attri
         Function that takes an event and a message and produces the appropriate reply.  The default implementation
         sends a NOTICE to the target nick.
 """
-from ircbot.commands import Command, Pattern, command, alias, bind, doc
+from ircbot.commands import Command, command, alias, bind, doc
+from ircbot.commands.commands import Pattern, Command, command, bind, alias, doc
 import functools
 import itertools
 import textwrap
