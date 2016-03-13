@@ -1,6 +1,6 @@
 Copyright (c) 2016 Daniel Grace
 
-This framework is licensed under the Apache License, Version 2.0.
+This framework is licensed under the Apache License, Version 2.0, with the following exception:
 
 Portions of usertrack.py are heavily derived from Pydle and thus are also 
 subject to the terms of its license, which is reproduced below:
