@@ -14,8 +14,11 @@ import textwrap
 import traceback
 import fractions
 import logging
-
+import inspect
+import asyncio
+from tornado.platform.asyncio import to_tornado_future
 import pydle
+from pydle.async import EventLoop
 
 import ircbot.commands
 import ircbot.usertrack
@@ -223,6 +226,21 @@ class EventEmitter(pydle.Client):
         super().__init__(*a, **kw)
         self.events = collections.defaultdict(DependencyDict)
 
+    @pydle.coroutine
+    def yield_if_needed(self, result):
+        """Discards result, but not before yielding through it first if it's futuristic."""
+        if isinstance(result, pydle.Future):
+            return (yield result)
+        elif asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+            loop = self.eventloop.io_loop.asyncio_loop
+            future = asyncio.ensure_future(result, loop=loop)
+            return (yield to_tornado_future(future))
+        return result
+
+    def on_message(self, target, nick, message):
+        super().on_message(target, nick, message)
+        return self.handle_message('PRIVMSG', target, nick, message)
+
     def emit(self, _event, *args, **kwargs):
         """
         Triggers the specified event.
@@ -234,7 +252,7 @@ class EventEmitter(pydle.Client):
         if _event not in self.events:
             pass
         for fn in self.events[_event]:
-            self.eventloop.schedule(fn, self, *args, **kwargs)
+            self.yield_if_needed(fn(self, *args, **kwargs))
 
     def emit_in(self, _when, _event, *args, **kwargs):
         """
@@ -352,7 +370,6 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         main = self.config.main
 
         self.event_factory = kwargs.pop('event_factory', Event)
-
         kwargs.setdefault('nickname', main.nicknames[0])
         kwargs.setdefault('fallback_nicknames', main.nicknames[1:])
         for attr in (
@@ -375,6 +392,8 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
             width=main.wrap_length, subsequent_indent=main.wrap_indent,
             replace_whitespace=False, tabsize=4, drop_whitespace=True
         )
+        if not self.eventloop:
+            self.eventloop = EventLoop()  # Don't wait until we're connected to establish this.
 
         self.data = {}
 
@@ -624,18 +643,11 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
                     event = factory(rule=rule, result=result)
                     with self.log_exceptions(target):
                         try:
-                            result = fn(event)
-                            if isinstance(result, pydle.Future):
-                                yield result
+                            yield self.yield_if_needed(fn(event))
                         except StopHandling:
                             break
                         except ircbot.commands.UsageError as ex:
                             self.notice(nick, str(ex))
-
-    def on_message(self, target, nick, message):
-        super().on_message(target, nick, message)
-        return self.handle_message('PRIVMSG', target, nick, message)
-
 
 def _implied_target(method):
     """
