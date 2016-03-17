@@ -97,6 +97,7 @@ class MainConfigSection(ConfigSection):
         self.prefix = section.get('prefix', '!')
         self.wrap_length = section.getint('wrap_length', 400)
         self.wrap_indent = section.get('wrap_indent', '...')
+        self.usermode = section.get('usermode', None)
 
         servers = []
         for server in re.split(r',+', section.get('server', '')):
@@ -445,6 +446,9 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
         """
         super().on_connect()
         self.logger.info("Connected.")
+        if self.config.main.usermode:
+            self.set_mode(self.nickname, self.config.main.usermode)
+
         for channel in self.config.main.channels:
             try:
                 self.join(**channel)
