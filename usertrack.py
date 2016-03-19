@@ -19,19 +19,49 @@ def dummy_future(result=None):
 
 
 class UserTrackingClient(pydle.featurize(pydle.features.AccountSupport, pydle.features.RFC1459Support)):
+    def on_user_create(self, user, nickname):
+        """Called when a user is created."""
+        pass
+
+    def on_user_delete(self, user, nickname):
+        """Called when a user is destroyed."""
+        pass
+
+    def on_user_update(self, user, nickname):
+        """Called when a user is updated (except for nickname changes.)"""
+        pass
+
+    def on_user_rename(self, user, nickname, oldname):
+        """Called when a user's nick is changed."""
+        pass
+
     def _create_user(self, nickname):
         super()._create_user(nickname)
         if nickname in self.users:
             self.users[nickname]['complete'] = False  # True if we've performed a whois or WHOX against this user.
+            self.users[nickname]['data'] = {}  # Misc user data for addons.
+        self.on_user_create(self.users.get(nickname), nickname)
 
     def _rename_user(self, user, new):
         super()._rename_user(user, new)
         self._sync_user(new, {'complete': False})
+        self.on_user_rename(self.users.get(new), new, user)
+
 
     def _sync_user(self, nick, metadata):
         if 'identified' in metadata and 'account' in metadata:
             metadata.setdefault('complete', True)
-        return super()._sync_user(nick, metadata)
+        udata = self.users.get(nick)
+        changed = udata is None or any(k in udata and udata[k] == v for k, v in metadata.items())
+        super()._sync_user(nick, metadata)
+        if changed:
+            self.on_user_update(udata, nick)
+
+    def _destroy_user(self, user, channel=None):
+        udata = self.users.get(user)
+        super()._destroy_user(self, user, channel)
+        if udata and user not in self.users:
+            self.on_user_delete(udata, user)
 
     def whois(self, nickname):
         """
@@ -118,5 +148,5 @@ class UserTrackingClient(pydle.featurize(pydle.features.AccountSupport, pydle.fe
             yield dummy_future()
             return user.get(key, default)
 
-        result = yield self.whois(user)
+        result = yield self.whois(nickname)
         return result.get(key, default) if result else default

@@ -329,7 +329,7 @@ def _add_emitter(attr):
     fn = getattr(EventEmitter, attr)
     if not callable(fn):
         return
-    event = attr[3:]
+    event = attr[3:]  # Remove 'on_'
 
     @functools.wraps(fn)
     def wrapper(self, *args, **kwargs):
