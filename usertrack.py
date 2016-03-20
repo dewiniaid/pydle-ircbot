@@ -1,24 +1,25 @@
 """Improved usertracking capabilities."""
+import logging
 import pydle
-from pydle.features.rfc1459 import protocol
+from pydle.features.rfc1459 import protocol, parsing
 from pydle.async import Future, parallel
+
 import pydle.features
+
+logger = logging.getLogger(__name__)
 # Portions of UserTrackingClient are directly derived from code in Pydle and thus are subject to its license.
 # The Pydle license and related information can be found in LICENSE.md
 
 
-def dummy_future(result=None):
-    """
-    Creates a future with a predetermined result.  Used for cases where we might return a 'real' future but sometimes
-    we can resume immediately.
-    :return: Created future.
-    """
-    future = Future()
-    future.set_result(result)
-    return future
+class UserTrackingClient(pydle.Client):
+    def _reset_attributes(self):
+        # Work around framework bugs.
+        super()._reset_attributes()
+        self._pending['whois'] = parsing.NormalizingDict(self._pending['whois'], case_mapping=self._case_mapping)
+        self._pending['whowas'] = parsing.NormalizingDict(self._pending['whowas'], case_mapping=self._case_mapping)
+        self._whois_info = parsing.NormalizingDict(self._whois_info, case_mapping=self._case_mapping)
+        self._whowas_info = parsing.NormalizingDict(self._whowas_info, case_mapping=self._case_mapping)
 
-
-class UserTrackingClient(pydle.featurize(pydle.features.AccountSupport, pydle.features.RFC1459Support)):
     def on_user_create(self, user, nickname):
         """Called when a user is created."""
         pass
@@ -35,33 +36,72 @@ class UserTrackingClient(pydle.featurize(pydle.features.AccountSupport, pydle.fe
         """Called when a user's nick is changed."""
         pass
 
+    def _cleanup_user(self, nick):
+        """
+        Destroys a user if it's not on our monitor list or in any channels.
+
+        Scheduled task to work around https://github.com/Shizmob/pydle/issues/32
+        """
+        if nick not in self.users:
+            return
+        try:
+            del self.users[nick]['_cleanup_handle']
+        except KeyError:
+            pass
+        if self.can_see_nick(nick):
+            return
+        logger.debug("_cleanup_user(): Cleaning up {!r}".format(nick))
+        self._destroy_user(nick)
+
+    def _schedule_user_cleanup(self, nick):
+        udata = self.users.get(nick)
+        if udata is None:
+            return
+        if udata.get('_cleanup_handle') is not None:
+            return
+        udata['_cleanup_handle'] = self.eventloop.schedule(self._cleanup_user, nick) or True
+
     def _create_user(self, nickname):
         super()._create_user(nickname)
-        if nickname in self.users:
-            self.users[nickname]['complete'] = False  # True if we've performed a whois or WHOX against this user.
-            self.users[nickname]['data'] = {}  # Misc user data for addons.
-        self.on_user_create(self.users.get(nickname), nickname)
+        if nickname == self.nickname:
+            return
+        if nickname not in self.users:
+            return
+        self.users[nickname]['complete'] = False  # True if we've performed a whois or WHOX against this user.
+        self.users[nickname]['data'] = {}  # Misc user data for addons.
+        self.on_user_create(self.users[nickname], nickname)
+        self._schedule_user_cleanup(nickname)
 
     def _rename_user(self, user, new):
         super()._rename_user(user, new)
+        if new == self.nickname:  # By the time _rename_user is called, we've already updated our own nick
+            return
         self._sync_user(new, {'complete': False})
         self.on_user_rename(self.users.get(new), new, user)
 
-
     def _sync_user(self, nick, metadata):
+        if nick == self.nickname:
+            return super()._sync_user(nick, metadata)
         if 'identified' in metadata and 'account' in metadata:
             metadata.setdefault('complete', True)
         udata = self.users.get(nick)
-        changed = udata is None or any(k in udata and udata[k] == v for k, v in metadata.items())
+        changed = udata is None or any(k not in udata or udata[k] == v for k, v in metadata.items())
         super()._sync_user(nick, metadata)
-        if changed:
+        udata = self.users.get(nick)
+        if changed and udata:
             self.on_user_update(udata, nick)
+        self.eventloop.schedule(self._cleanup_user, nick)
 
-    def _destroy_user(self, user, channel=None):
+    def _destroy_user(self, user, channel=None, **kwargs):
         udata = self.users.get(user)
-        super()._destroy_user(self, user, channel)
+        super()._destroy_user(user, channel, **kwargs)
+        if user == self.nickname:
+            return
         if udata and user not in self.users:
             self.on_user_delete(udata, user)
+
+    def can_see_nick(self, nick):
+        return self.is_monitoring(nick) or any(nick in ch['users'] for ch in self.channels.values())
 
     def whois(self, nickname):
         """
@@ -76,7 +116,7 @@ class UserTrackingClient(pydle.featurize(pydle.features.AccountSupport, pydle.fe
         nicknames = set(filter(None, [nick.strip() for nick in nickname]))
         if not nicknames or any(protocol.ARGUMENT_SEPARATOR.search(nickname) is not None for nickname in nicknames):
             # IRCds don't like spaces in nicknames.  Adapted from pydle.features.rfc1459
-            return dummy_future()
+            return None
 
         all_futures = set()  # Store all relevant futures.
         drop_nicknames = []  # List of nicknames we'll delete after the pass.
@@ -128,6 +168,19 @@ class UserTrackingClient(pydle.featurize(pydle.features.AccountSupport, pydle.fe
             self._whois_info[nickname].update(info)
         super().on_raw_307(message)
 
+    def on_raw_301(self, message):
+        """User is away.  Patches around a Pydle bug."""
+        nickname, message = message.params[1:]
+        info = {
+            'away': True,
+            'away_message': message
+        }
+
+        if nickname in self.users:
+            self._sync_user(nickname, info)
+        if nickname in self._pending['whois']:
+            self._whois_info[nickname].update(info)
+
     @pydle.coroutine
     def get_user_value(self, nickname, key, default=None, must_exist=False):
         """
@@ -141,11 +194,11 @@ class UserTrackingClient(pydle.featurize(pydle.features.AccountSupport, pydle.fe
         """
         user = self.users.get(nickname)
         if not user and must_exist:
-            yield dummy_future()
+            # yield dummy_future()
             return default
 
-        if key in user and user.get('complete'):
-            yield dummy_future()
+        if user and key in user and user.get('complete'):
+            # yield dummy_future()
             return user.get(key, default)
 
         result = yield self.whois(nickname)

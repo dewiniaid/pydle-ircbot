@@ -207,7 +207,7 @@ class Pattern:
         self.item_kwargs = kwargs
 
     def __repr__(self):
-        return "<{}({!r})>".format(self.__class__.__name__, self.key or self.pattern)
+        return "<{}({!r})>".format(type(self).__name__, self.key or self.pattern)
 
 
 class Command:
@@ -277,7 +277,7 @@ class Command:
 
         done = kwargs.pop('_done', self._done)
 
-        created = self.__class__(**kwargs)
+        created = type(self)(**kwargs)
         created._done = done
         if registry:
             registry.register(created)
@@ -315,7 +315,7 @@ class Command:
                     raise
                 if isinstance(ex, PrecheckError):
                     continue
-                if error is None or binding.default_error:
+                if error is None or binding.is_default_error:
                     error = ex
                     error_binding = binding
         if self.usage:
@@ -325,7 +325,7 @@ class Command:
         raise error
 
     def __repr__(self):
-        return "<{}({!r})>".format(self.__class__.__name__, self.name or (self.aliases[0] if self.aliases else None))
+        return "<{}({!r})>".format(type(self).__name__, self.name or (self.aliases[0] if self.aliases else None))
 
     @classmethod
     def from_pending(cls, pending, registry=None, **kwargs):

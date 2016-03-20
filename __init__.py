@@ -222,26 +222,40 @@ class Config:
         return self.sections[item]
 
 
-class EventEmitter(pydle.Client):
+class EventEmitter(ircbot.usertrack.UserTrackingClient):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.events = collections.defaultdict(DependencyDict)
 
-    @pydle.coroutine
-    def yield_if_needed(self, result):
-        """Discards result, but not before yielding through it first if it's futuristic."""
-        if isinstance(result, pydle.Future):
-            return (yield result)
-        elif asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
-            loop = self.eventloop.io_loop.asyncio_loop
-            future = asyncio.ensure_future(result, loop=loop)
-            return (yield to_tornado_future(future))
-        return result
+    def adapt_result(self, result):
+        while True:
+            if isinstance(result, pydle.Future):
+                result = yield result
+            elif asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+                result = yield to_tornado_future(
+                    asyncio.ensure_future(result, loop=self.eventloop.io_loop.asyncio_loop)
+                )
+            else:
+                return result
 
+    # @pydle.coroutine
+    # def yield_if_needed(self, result):
+    #     """Discards result, but not before yielding through it first if it's futuristic."""
+    #     return self.adapt_result(result)
+    #
+    #     if isinstance(result, pydle.Future):
+    #         return (yield result)
+    #     elif asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+    #         loop = self.eventloop.io_loop.asyncio_loop
+    #         future = asyncio.ensure_future(result, loop=loop)
+    #         return (yield to_tornado_future(future))
+    #     return result
+    #
     def on_message(self, target, nick, message):
         super().on_message(target, nick, message)
         return self.handle_message('PRIVMSG', target, nick, message)
 
+    @pydle.coroutine
     def emit(self, _event, *args, **kwargs):
         """
         Triggers the specified event.
@@ -253,7 +267,7 @@ class EventEmitter(pydle.Client):
         if _event not in self.events:
             pass
         for fn in self.events[_event]:
-            self.yield_if_needed(fn(self, *args, **kwargs))
+            yield from self.adapt_result(fn(self, *args, **kwargs))
 
     def emit_in(self, _when, _event, *args, **kwargs):
         """
@@ -341,6 +355,7 @@ def _add_emitter(attr):
 for _attr in filter(lambda x: x.startswith('on_') and not x.startswith('on_raw_') and x != 'on_raw', dir(EventEmitter)):
     _add_emitter(_attr)
 del _add_emitter
+del _attr
 
 
 class Registry(ircbot.commands.Registry):
@@ -353,7 +368,7 @@ class Registry(ircbot.commands.Registry):
             return event.command(event)
 
 
-class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
+class Bot(EventEmitter):
     def __init__(self, config=None, filename=None, data=None, **kwargs):
         """
         Creates a new Bot.
@@ -647,7 +662,8 @@ class Bot(pydle.featurize(EventEmitter, ircbot.usertrack.UserTrackingClient)):
                     event = factory(rule=rule, result=result)
                     with self.log_exceptions(target):
                         try:
-                            yield self.yield_if_needed(fn(event))
+                            yield from self.adapt_result(fn(event))
+                            # yield self.yield_if_needed(fn(event))
                         except StopHandling:
                             break
                         except ircbot.commands.UsageError as ex:

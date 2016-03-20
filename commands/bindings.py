@@ -583,6 +583,9 @@ class ConstParamType(ParamType):
         if not self.values:
             raise ParseError("Must have at least one constant value.")
 
+    def parse(self, event, value):
+        return value.lower()
+
     def validate(self, event, value):
         if value not in self.values:
             if len(self.values) == 1:
@@ -648,3 +651,4 @@ class NumberParamType(ParamType):
                 "{0.param.name} must be <= {0.minvalue}"
                 .format(self)
             )
+        return value

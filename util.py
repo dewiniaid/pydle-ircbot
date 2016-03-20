@@ -74,7 +74,7 @@ class Throttle:
     _FUTURE_CLASSES = (pydle.async.Future, tornado.concurrent.Future, asyncio.Future, concurrent.futures.Future)
     ZEROTIME = datetime.timedelta()
     _now = datetime.datetime.now
-    _m = 0
+    # _m = 0
 
     def __init__(self, burst, rate, amount=1, on_clear=None):
         """
@@ -107,9 +107,9 @@ class Throttle:
         self._wake_condition = tornado.locks.Condition()
         self._stop_condition = None
         self.running = False
-        self._m = self.__class__._m
-        self.__class__._m += 1
-        self._n = 0
+        # self._m = type(self)._m
+        # type(self)._m += 1
+        # self._n = 0
 
     def wake(self):
         """
@@ -198,7 +198,7 @@ class Throttle:
             self.running = True
             self._stop_condition = None
             while not self._stop_condition:
-                self._n += 1
+                # self._n += 1
                 # Recover capacity
                 if self.rate and self.free < self.burst:
                     # How much time has gone by?
@@ -311,12 +311,12 @@ class _DependencyPriority:
         return hash(self.name) ^ 0x20160307  # Arbitrary-ish xor
 
     def __eq__(self, other):
-        if not isinstance(other.__class__, self.__class__):
+        if not isinstance(type(other), type(self)):
             raise TypeError
         return self.name == other.name
 
     def __le__(self, other):
-        if not isinstance(other.__class__, self.__class__):
+        if not isinstance(type(other), type(self)):
             raise TypeError
         return self.name < other.name
 

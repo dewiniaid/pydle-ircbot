@@ -35,7 +35,7 @@ class ParseError(ValueError):
         values = [self.message or 'Parse error', self.text, self.pos]
         while values and values[-1] is None:
             values.pop()
-        return self.__class__.__name__ + repr(tuple(values))
+        return type(self).__name__ + repr(tuple(values))
 
     def show(self, maxwidth=None, after=10):
         """
